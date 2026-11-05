@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+agy-unlock-1m — Sblocco automatico, permanente e multipiattaforma (Linux x86_64 ELF +
+macOS arm64 Apple Silicon Mach-O) del motore da 1M token in uscita e della finestra
+di contesto continua da 950k token in ingresso (prima della compattazione) per
+Antigravity CLI (argon, agy, agy1..agy4).
+
+Funzionamento a prova di aggiornamento (offset-indipendente):
+  1. Se un aggiornamento esterno ha sovrascritto ~/.local/bin/agy con un binario
+     nativo (ELF o Mach-O) invece dell'involucro bash, sposta automaticamente il
+     nuovo binario in ~/.local/bin/agy-bin e ripristina l'involucro bash ~/.local/bin/agy.
+  2. Sblocca nel binario ~/.local/bin/agy-bin:
+     a) Limite per singolo segmento HTTP (CascadePlannerConfig, buildRequest,
+        buildCompletionConfig): da 0x4000 (16.384 token) a 0x10000 (65.536 token).
+     b) Tetto totale di continuation.Orchestrator (32 segmenti da 64k): da 16.384
+        a 0x100000 (1.048.576 = 1M token in uscita continua).
+     c) Soglia di compattazione automatica del contesto in ingresso
+        (utils.GetCheckpointConfig -> CheckpointConfig.MaxTokenLimit): da 0x3e800
+        (256.000 token, cioè solo il 24% della finestra da 1M!) a 0xe7ef0
+        (950.000 token, cioè il 90,6% della finestra da 1M) e summary output da
+        16k a 64k.
+  3. Su macOS (Darwin arm64) firma automaticamente il binario patchato con
+     `codesign -f -s -` per soddisfare AMFI/Gatekeeper di Apple Silicon.
+  4. Su Linux applica inoltre l'hot-patch in RAM (/proc/<pid>/mem) ai processi
+     agy-bin già in esecuzione, senza interrompere le sessioni attive.
+"""
+from __future__ import annotations
+
+import glob
+import os
+import shutil
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+
+def resolve_real_home() -> Path:
+    """Risolve la home principale dell'utente anche dentro un profilo .agy-account/*."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and os.geteuid() == 0:
+        import pwd
+        return Path(pwd.getpwnam(sudo_user).pw_dir)
+    h = Path.home()
+    parts = h.parts
+    if ".agy-account" in parts:
+        idx = parts.index(".agy-account")
+        return Path(*parts[:idx])
+    return h
+
+
+REAL_HOME = resolve_real_home()
+BIN_DIR = REAL_HOME / ".local" / "bin"
+AGY_WRAPPER = BIN_DIR / "agy"
+AGY_BIN = BIN_DIR / "agy-bin"
+AGY_BAK = BIN_DIR / "agy-bin.bak-16k"
+STAMP_FILE = BIN_DIR / ".agy-bin.1m-stamp"
+
+WRAPPER_CONTENT = """#!/usr/bin/env bash
+# agy — involucro multipiattaforma (Linux + macOS) che accende la modalita' senza
+# domande e garantisce lo sblocco permanente 1M out / 950k in dopo ogni update.
+set -uo pipefail
+REAL_HOME="${HOME%/.agy-account/*}"
+VERO="$REAL_HOME/.local/bin/agy-bin"
+STAMP="$REAL_HOME/.local/bin/.agy-bin.1m-stamp"
+UNLOCK="$REAL_HOME/bin/agy-unlock-1m"
+[[ -x "$UNLOCK" ]] || UNLOCK="$REAL_HOME/.local/bin/agy-unlock-1m"
+[[ -x "$VERO" ]] || { echo "agy: binario assente in $VERO" >&2; exit 127; }
+CUR_SIG="$(stat -c '%Y:%s' "$VERO" 2>/dev/null || stat -f '%m:%z' "$VERO" 2>/dev/null || true)"
+if [[ ! -f "$STAMP" ]] || [[ "$(cat "$STAMP" 2>/dev/null)" != "$CUR_SIG" ]]; then
+    "$UNLOCK" --quiet || true
+fi
+for a in "$@"; do
+    [[ "$a" == "--dangerously-skip-permissions" ]] && exec "$VERO" "$@"
+done
+exec "$VERO" --dangerously-skip-permissions "$@"
+"""
+
+# Firme machine-code x86_64 (ELF Linux) indipendenti dagli offset di memoria
+X86_64_RULES: list[tuple[str, bytes, bytes]] = [
+    (
+        "CascadePlannerConfig 64k/leg",
+        bytes.fromhex("81f900400000ba004000000f42d185c9b900400000"),
+        bytes.fromhex("81f900000100ba000001000f42d185c9b900000100"),
+    ),
+    (
+        "requestBuilder.buildRequest 64k/leg",
+        bytes.fromhex("458b51704585c041bb00400000450f45d8"),
+        bytes.fromhex("458b51704585c041bb000001000f1f4000"),
+    ),
+    (
+        "integration.buildCompletionConfig 64k/leg",
+        bytes.fromhex("85d2740e4885c974058b5168eb0931d2eb05ba00400000"),
+        bytes.fromhex("85d2eb0e4885c974058b5168eb0931d2eb05ba00000100"),
+    ),
+    (
+        "continuation.Orchestrator 1M total output",
+        bytes.fromhex(
+            "488b8c24c00200004885c97406488b5128eb0231d24885d27409"
+            "488b92a8000000eb0231d24885d2740d488b52284885d274048b12eb0231d2"
+        ),
+        bytes.fromhex(
+            "ba00001000eb32904885c97406488b5128eb0231d24885d27409"
+            "488b92a8000000eb0231d24885d2740d488b52284885d274048b12eb0231d2"
+        ),
+    ),
+    (
+        "CheckpointConfig MaxTokenLimit 256k->950k",
+        bytes.fromhex("8b54244c81fa00e80300be00e803000f42f289742450"),
+        bytes.fromhex("8b54244c81faf07e0e00bef07e0e000f42f289742450"),
+    ),
+    (
+        "CheckpointConfig SummaryMaxOutput 16k->64k",
+        bytes.fromhex("85d281fa00400000bf004000000f42fa85d2ba004000000f4fd7"),
+        bytes.fromhex("85d281fa00000100bf000001000f42fa85d2ba000001000f4fd7"),
+    ),
+    (
+        "CheckpointConfig FallbackMaxTokenLimit 256k->950k",
+        bytes.fromhex("837a14007f07c7400c00e80300"),
+        bytes.fromhex("837a14007f07c7400cf07e0e00"),
+    ),
+]
+
+
+def is_native_binary(head: bytes) -> bool:
+    return head in (
+        b"\x7fELF",
+        b"\xcf\xfa\xed\xfe",  # Mach-O 64-bit LE
+        b"\xca\xfe\xba\xbe",  # Mach-O Universal/Fat
+        b"\xfe\xed\xfa\xcf",  # Mach-O 64-bit BE
+    )
+
+
+def ensure_wrapper_intact(quiet: bool = False) -> None:
+    """Se un installer ha sovrascritto ~/.local/bin/agy con un binario nativo, lo sposta in agy-bin."""
+    if not AGY_WRAPPER.exists() or AGY_WRAPPER.is_symlink():
+        return
+    try:
+        with open(AGY_WRAPPER, "rb") as f:
+            head = f.read(4)
+    except Exception:
+        return
+    if is_native_binary(head):
+        tmp_bin = BIN_DIR / "agy-bin.from-installer"
+        shutil.copy2(AGY_WRAPPER, tmp_bin)
+        os.replace(tmp_bin, AGY_BIN)
+        tmp_wrap = BIN_DIR / "agy.wrapper.tmp"
+        tmp_wrap.write_text(WRAPPER_CONTENT, encoding="utf-8")
+        os.chmod(tmp_wrap, 0o755)
+        os.replace(tmp_wrap, AGY_WRAPPER)
+        if not quiet:
+            print("[agy-unlock-1m] Rilevato binario nativo in ~/.local/bin/agy: spostato in agy-bin e ripristinato wrapper.")
+
+
+def file_sig(path: Path) -> str:
+    st = path.stat()
+    return f"{int(st.st_mtime)}:{st.st_size}"
+
+
+def find_macho_text_section(data: bytearray) -> tuple[int, int, int]:
+    """Restituisce (slice_offset, text_file_offset, text_vmaddr) per Mach-O arm64."""
+    magic = bytes(data[:4])
+    slice_off = 0
+    if magic == b"\xca\xfe\xba\xbe":
+        nfat = struct.unpack_from(">I", data, 4)[0]
+        for i in range(nfat):
+            cputype, _, offset, _, _ = struct.unpack_from(">IIIII", data, 8 + i * 20)
+            if cputype == 0x0100000C:  # CPU_TYPE_ARM64
+                slice_off = offset
+                break
+    m_magic, _, _, _, ncmds, _, _, _ = struct.unpack_from("<IIIIIIII", data, slice_off)
+    if m_magic != 0xFEEDFACF:
+        raise ValueError("Mach-O 64-bit header non valido")
+    lc_off = slice_off + 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, lc_off)
+        if cmd == 0x19:  # LC_SEGMENT_64
+            _, _, segname, vmaddr, _, fileoff, _, _, _, nsects, _ = struct.unpack_from(
+                "<II16sQQQQII", data, lc_off
+            )
+            sect_off = lc_off + 72
+            for _ in range(nsects):
+                sectname, _, s_addr, _, s_offset, _, _, _, _, _, _, _ = struct.unpack_from(
+                    "<16s16sQQIIIIIIII", data, sect_off
+                )
+                if sectname.rstrip(b"\x00") == b"__text":
+                    return slice_off, slice_off + s_offset, s_addr
+                sect_off += 80
+        lc_off += cmdsize
+    raise ValueError("Sezione __TEXT,__text non trovata in Mach-O")
+
+
+def locate_go_functions(data: bytearray, slice_off: int, text_file_off: int, text_vmaddr: int) -> dict[str, tuple[int, int]]:
+    """Trova gli intervalli file [start, end) delle funzioni Go tramite .gopclntab."""
+    pos = slice_off
+    gop_off = -1
+    while True:
+        idx = data.find(b"\xf1\xff\xff\xff\x00\x00", pos)
+        if idx == -1:
+            break
+        _, _, min_lc, ptr_sz, nfunc, _, text_start, funcname_off, _, _, _, pcln_off = struct.unpack_from(
+            "<IHBBQQQQQQQQ", data, idx
+        )
+        if min_lc in (1, 2, 4) and ptr_sz == 8 and 1000 < nfunc < 500000:
+            gop_off = idx
+            break
+        pos = idx + 1
+    if gop_off == -1:
+        return {}
+    _, _, min_lc, ptr_sz, nfunc, _, text_start, funcname_off, _, _, _, pcln_off = struct.unpack_from(
+        "<IHBBQQQQQQQQ", data, gop_off
+    )
+    ftab_base = gop_off + pcln_off
+    funcname_base = gop_off + funcname_off
+    base_delta = (text_start - text_vmaddr) if (text_start and text_vmaddr and text_start >= text_vmaddr) else 0
+    funcs: dict[str, tuple[int, int]] = {}
+    for i in range(nfunc):
+        entry_off, func_off = struct.unpack_from("<II", data, ftab_base + i * 8)
+        next_entry_off, _ = struct.unpack_from("<II", data, ftab_base + (i + 1) * 8)
+        _, name_off = struct.unpack_from("<Ii", data, ftab_base + func_off)
+        end = data.find(b"\x00", funcname_base + name_off)
+        name = data[funcname_base + name_off : end].decode("utf-8", errors="ignore")
+        f_start = text_file_off + base_delta + entry_off
+        f_end = text_file_off + base_delta + next_entry_off
+        funcs[name] = (f_start, f_end)
+    return funcs
+
+
+def patch_macho_arm64(data: bytearray, quiet: bool = False) -> tuple[bool, list[tuple[int, bytes, bytes]]]:
+    """Applica lo sblocco 1M out / 950k in su binario Mach-O arm64 (Apple Silicon)."""
+    slice_off, text_file_off, text_vmaddr = find_macho_text_section(data)
+    funcs = locate_go_functions(data, slice_off, text_file_off, text_vmaddr)
+    modified = False
+    patches: list[tuple[int, bytes, bytes]] = []
+
+    clamp_64k_suffixes = (
+        "config.defaultConversationalCascadeConfig",
+        "config.defaultTrainEvalConversationalCascadeConfig",
+        "config.defaultAgenticCascadeConfig",
+        "(*requestBuilder).buildRequest",
+        "integration.buildCompletionConfig",
+        "utils.GetCheckpointConfig",
+        "utils.GetDefaultCheckpointConfigForModel",
+    )
+    for fname, (f_start, f_end) in funcs.items():
+        if any(fname.endswith(s) for s in clamp_64k_suffixes):
+            for off in range(max(slice_off, f_start), min(len(data) - 4, f_end + 128), 4):
+                inst = struct.unpack_from("<I", data, off)[0]
+                old_b = bytes(data[off : off + 4])
+                # MOVZ Wd/Xd, #0x4000 -> MOVZ Wd/Xd, #0x1, LSL #16 (0x10000 = 64k)
+                if (inst & 0x7FFFFFE0) == 0x52880000:
+                    new_inst = (inst & 0x8000001F) | 0x52A00020
+                    new_b = struct.pack("<I", new_inst)
+                    data[off : off + 4] = new_b
+                    patches.append((off, old_b, new_b))
+                    modified = True
+                # CMP Wn/Xn, #4, LSL #12 (0x4000) -> CMP Wn/Xn, #16, LSL #12 (0x10000)
+                elif (inst & 0x7FFFFC1F) == 0x7140101F:
+                    new_inst = (inst & 0x800003E0) | 0x7140401F
+                    new_b = struct.pack("<I", new_inst)
+                    data[off : off + 4] = new_b
+                    patches.append((off, old_b, new_b))
+                    modified = True
+                elif (inst & 0x7FFFFFE0) == 0x52A00020 or (inst & 0x7FFFFC1F) == 0x7140401F:
+                    patches.append((off, old_b, old_b))
+
+        # Sblocco soglia compattazione 256k (0x3e800) -> 950k (0xe7ef0) in GetCheckpointConfig
+        if fname.endswith("utils.GetCheckpointConfig"):
+            for off in range(max(slice_off, f_start), min(len(data) - 8, f_end + 128), 4):
+                inst1, inst2 = struct.unpack_from("<II", data, off)
+                # MOVZ Wd/Xd, #0xe800 (0x529d0000) + MOVK Wd/Xd, #0x3, LSL #16 (0x72a00060)
+                if (inst1 & 0x7FFFFFE0) == 0x529D0000 and (inst2 & 0x7FFFFFE0) == 0x72A00060:
+                    old_b = bytes(data[off : off + 8])
+                    new1 = (inst1 & 0x8000001F) | 0x528FDE00  # MOVZ #0x7ef0
+                    new2 = (inst2 & 0x8000001F) | 0x72A001C0  # MOVK #0xe, LSL #16
+                    new_b = struct.pack("<II", new1, new2)
+                    data[off : off + 8] = new_b
+                    patches.append((off, old_b, new_b))
+                    modified = True
+                elif (inst1 & 0x7FFFFFE0) == 0x528FDE00 and (inst2 & 0x7FFFFFE0) == 0x72A001C0:
+                    old_b = bytes(data[off : off + 8])
+                    patches.append((off, old_b, old_b))
+
+        # Sblocco tetto 1M totale in continuation.(*Orchestrator).EvaluateLegEnd
+        if fname.endswith("(*Orchestrator).EvaluateLegEnd"):
+            for off in range(max(slice_off, f_start), min(len(data) - 4, f_end + 128), 4):
+                inst = struct.unpack_from("<I", data, off)[0]
+                old_b = bytes(data[off : off + 4])
+                # LDR Wd, [X0, #0xc0] (0xB940C000) o LDRSW Xd, [X0, #0xc0] (0xB980C000)
+                if (inst & 0xFFBFFFFF) in [0xB940C000 | r for r in range(31)]:
+                    rd = inst & 0x1F
+                    new_inst = 0x52A00200 | rd  # MOVZ Wd, #0x10, LSL #16 (0x100000 = 1M)
+                    new_b = struct.pack("<I", new_inst)
+                    data[off : off + 4] = new_b
+                    patches.append((off, old_b, new_b))
+                    modified = True
+                elif (inst & 0xFFFFFFE0) == 0x52A00200:
+                    patches.append((off, old_b, old_b))
+
+    return modified, patches
+
+
+def hot_patch_live_ram(patch_offsets: list[tuple[int, bytes, bytes]], quiet: bool = False) -> int:
+    """Applica l'hot-patch in RAM a tutti i processi agy-bin attivi (Linux /proc/<pid>/mem)."""
+    if sys.platform != "linux" or not patch_offsets:
+        return 0
+    if os.geteuid() != 0:
+        try:
+            res = subprocess.run(
+                ["sudo", "-n", sys.executable, __file__, "--ram-only"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            if not quiet and res.stdout.strip():
+                print(res.stdout.strip())
+            return 0
+        except Exception:
+            return 0
+
+    patched_pids = 0
+    for maps_file in glob.glob("/proc/[0-9]*/maps"):
+        pid = maps_file.split("/")[2]
+        try:
+            with open(maps_file, encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+        for line in lines:
+            if "r-xp" in line and "agy-bin" in line and ".old" not in line:
+                parts = line.split()
+                start_hex = parts[0].split("-")[0]
+                file_off_hex = parts[2]
+                base = int(start_hex, 16) - int(file_off_hex, 16)
+                mem_path = f"/proc/{pid}/mem"
+                try:
+                    with open(mem_path, "r+b", buffering=0) as mf:
+                        ok = 0
+                        for off, old, new in patch_offsets:
+                            mf.seek(base + off)
+                            cur = mf.read(len(old))
+                            if cur == old:
+                                mf.seek(base + off)
+                                mf.write(new)
+                                ok += 1
+                            elif cur == new:
+                                ok += 1
+                        if ok == len(patch_offsets):
+                            patched_pids += 1
+                except Exception:
+                    pass
+                break
+    if not quiet and patched_pids:
+        print(f"[agy-unlock-1m] Hot-patch RAM applicata a {patched_pids} processi agy-bin attivi.")
+    return patched_pids
+
+
+def main() -> int:
+    quiet = "--quiet" in sys.argv
+    force = "--force" in sys.argv
+    ram_only = "--ram-only" in sys.argv
+
+    if not ram_only:
+        ensure_wrapper_intact(quiet=quiet)
+
+    if not AGY_BIN.is_file():
+        if not quiet:
+            print(f"[agy-unlock-1m] Binario non trovato: {AGY_BIN}", file=sys.stderr)
+        return 1
+
+    if not force and not ram_only and STAMP_FILE.is_file():
+        try:
+            if STAMP_FILE.read_text(encoding="utf-8").strip() == file_sig(AGY_BIN):
+                return 0
+        except Exception:
+            pass
+
+    data = bytearray(AGY_BIN.read_bytes())
+    head = bytes(data[:4])
+    modified = False
+    patch_offsets: list[tuple[int, bytes, bytes]] = []
+
+    if head in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"):
+        modified, patch_offsets = patch_macho_arm64(data, quiet=quiet)
+    else:
+        for name, old, new in X86_64_RULES:
+            assert len(old) == len(new)
+            pos = 0
+            found_any = False
+            while True:
+                idx_old = data.find(old, pos)
+                if idx_old != -1:
+                    data[idx_old : idx_old + len(new)] = new
+                    patch_offsets.append((idx_old, old, new))
+                    modified = True
+                    found_any = True
+                    pos = idx_old + len(new)
+                else:
+                    break
+            pos = 0
+            while True:
+                idx_new = data.find(new, pos)
+                if idx_new != -1:
+                    if not any(o == idx_new for o, _, _ in patch_offsets):
+                        patch_offsets.append((idx_new, old, new))
+                    found_any = True
+                    pos = idx_new + len(new)
+                else:
+                    break
+            if not found_any and not quiet:
+                print(f"[agy-unlock-1m] ATTENZIONE: firma '{name}' non trovata in {AGY_BIN}", file=sys.stderr)
+
+    if ram_only:
+        hot_patch_live_ram(patch_offsets, quiet=quiet)
+        return 0
+
+    if modified:
+        if not AGY_BAK.exists():
+            shutil.copy2(AGY_BIN, AGY_BAK)
+        tmp_new = BIN_DIR / "agy-bin.new"
+        tmp_new.write_bytes(data)
+        os.chmod(tmp_new, 0o755)
+        if sys.platform == "darwin":
+            subprocess.run(["codesign", "-f", "-s", "-", str(tmp_new)], check=False, capture_output=True)
+        os.replace(tmp_new, AGY_BIN)
+        if not quiet:
+            print(f"[agy-unlock-1m] Patch 1M out / 950k in applicata a {AGY_BIN} ({len(patch_offsets)} siti).")
+    else:
+        if not quiet:
+            print(f"[agy-unlock-1m] {AGY_BIN} già sbloccato a 1M out / 950k in ({len(patch_offsets)} siti verificati).")
+
+    try:
+        STAMP_FILE.write_text(file_sig(AGY_BIN) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    hot_patch_live_ram(patch_offsets, quiet=quiet)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

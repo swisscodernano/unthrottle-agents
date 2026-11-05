@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""agy-statusline — Barra di stato a 2 righe per Antigravity CLI (argon, agy, agy1..agy4).
+
+Riga 1 (telemetria completa, sempre entro terminal_width):
+  argon.4-(high) │ ██░░░░░░ 18% │ in:187k/1M out:2.3k/64k(Σ1.3M) │ ↓33.4k/s(5.6s) ↑86/s(1.7s) │ 5h:10% 7d:2% │ $0.00 │ 00:27
+Riga 2 (riassunto di fine task leggibile per intero su tutta la larghezza del terminale):
+  ↳ ult:00:27 │ <riassunto di fine task>
+"""
+from __future__ import annotations
+
+import datetime as dt
+import glob
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+FLOTTA_BUS = "/home/gemini-admin/bin/flotta-bus"
+PLACEHOLDER_SPEED = "↓–(0s) ↑–(0s)"
+DEFAULT_IN_CTX_MAX = 1_048_576  # 0x100000 in defaultmodels.GeminiModelInfo (1M input context window)
+DEFAULT_OUT_CTX_MAX = 1_048_576 # 0x100000 in continuation.Orchestrator (1M max output: 64k/leg x 16 legs)
+
+
+def fmt_tokens(n: int | float, precise_small_k: bool = False) -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        if n == 1_048_576:
+            return "1M"
+        v = n / 1_000_000.0
+        return f"{v:.1f}M".replace(".0M", "M")
+    if n >= 1_000:
+        if n == 65_536:
+            return "64k"
+        if precise_small_k and n < 10_000:
+            v = n / 1_000.0
+            return f"{v:.1f}k".replace(".0k", "k")
+        return f"{n // 1_000}k"
+    return str(n)
+
+
+def fmt_rate(v: float) -> str:
+    if v >= 1000.0:
+        return f"{v / 1000.0:.1f}k"
+    return f"{int(round(v))}"
+
+
+def fmt_sec(s: float) -> str:
+    return f"{s:.1f}s"
+
+
+def shorten_model(model_obj: Any) -> str:
+    if isinstance(model_obj, dict):
+        raw = str(model_obj.get("display_name") or model_obj.get("id") or "")
+        effort = str(model_obj.get("effort") or "").lower()
+    else:
+        raw = str(model_obj or "")
+        effort = ""
+    if not raw:
+        home = os.environ.get("HOME", "")
+        return "argon.4" if "argon" in home else "gemini.3.8.flash"
+    low = raw.lower()
+    if "argon" in low:
+        base = "argon.4"
+    elif "3.8" in low and "flash" in low:
+        base = "flash.3.8"
+    elif "pro" in low and "3.1" in low:
+        base = "pro.3.1"
+    else:
+        s = re.sub(r"^gemini\s+", "", low, flags=re.I)
+        s = re.sub(r"\s*\([^)]*\)", "", s).strip()
+        base = re.sub(r"[\s_]+", ".", s) or "agy"
+    if effort and effort not in ("medium", "auto") and f"({effort})" not in base:
+        return f"{base}-({effort})"
+    return base
+
+
+def parse_iso_ts(ts_raw: str) -> float | None:
+    if not ts_raw:
+        return None
+    try:
+        return dt.datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def clean_task_summary(text: str, max_len: int = 130) -> str:
+    if not text:
+        return ""
+    # Se è un messaggio di sistema di compaction senza <USER_REQUEST>, ignoralo
+    if "<CONTEXT_SUMMARY>" in text and "<USER_REQUEST>" not in text:
+        return ""
+    m_req = re.search(r"<USER_REQUEST>\s*(.+?)\s*</USER_REQUEST>", text, flags=re.DOTALL)
+    if m_req:
+        text = m_req.group(1)
+    text = re.sub(
+        r"<(task-notification|system-reminder|context_summary|system_message)[^>]*>.*?</\1>",
+        " ",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    # Cerca prima la riga di "Cosa è cambiato" (riassunto schematico di fine task)
+    cosa_cambiato: str = ""
+    raw_lines = text.splitlines()
+    for idx, raw_ln in enumerate(raw_lines):
+        ln_clean = raw_ln.replace("**", "").replace("`", "").strip()
+        ln_clean = re.sub(r"^[\-\*\•\d\.\)\s#]+", "", ln_clean).strip()
+        if ln_clean.lower().startswith("cosa è cambiato"):
+            after = re.sub(r"^cosa è cambiato\s*[:\-—–]?\s*", "", ln_clean, flags=re.I).strip()
+            if after:
+                cosa_cambiato = after
+                break
+            # Altrimenti prendi il primo bullet subito sotto "Cosa è cambiato"
+            for sub_ln in raw_lines[idx + 1 : idx + 5]:
+                s_clean = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", sub_ln)
+                s_clean = re.sub(r"^[\-\*\•\d\.\)\s#]+", "", s_clean)
+                s_clean = s_clean.replace("**", "").replace("`", "").strip()
+                if s_clean:
+                    cosa_cambiato = s_clean
+                    break
+            if cosa_cambiato:
+                break
+
+    if cosa_cambiato:
+        first = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cosa_cambiato)
+        first = re.sub(r"\s+", " ", first).strip()
+        if len(first) > max_len:
+            return first[: max_len - 1].rstrip() + "…"
+        return first
+
+    lines: list[str] = []
+    for raw_ln in raw_lines:
+        ln = raw_ln.strip()
+        if not ln:
+            continue
+        if re.match(r"^[0-2]\d:[0-5]\d\s+[A-Z]{2,5}\s+\d{2}/\d{2}/\d{4}$", ln):
+            continue
+        if re.match(r"^[-=*#`>]+$", ln):
+            continue
+        ln = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", ln)
+        ln = re.sub(r"^[\-\*\•\d\.\)\s#]+", "", ln)
+        ln = ln.replace("**", "").replace("`", "").strip()
+        if not ln:
+            continue
+        if ln.lower().startswith(("cosa abbiamo deciso", "cosa resta aperto", "cosa serve da te")):
+            continue
+        lines.append(ln)
+    if not lines:
+        return ""
+    first = re.sub(r"\s+", " ", lines[0]).strip()
+    if len(first) > max_len:
+        return first[: max_len - 1].rstrip() + "…"
+    return first
+
+
+def find_transcript_path(data: dict[str, Any]) -> Path | None:
+    tp = str(data.get("transcript_path") or "").strip()
+    if tp and os.path.isfile(tp):
+        return Path(tp)
+    cid = str(data.get("conversation_id") or data.get("session_id") or "").strip()
+    home = os.environ.get("HOME", "/home/gemini-admin")
+    if cid:
+        for pat in (
+            f"{home}/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl",
+            f"/home/gemini-admin/.agy-account/*/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl",
+            f"/home/gemini-admin/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl",
+        ):
+            matches = glob.glob(pat)
+            if matches:
+                return Path(matches[0])
+    candidates = glob.glob(f"{home}/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl")
+    if candidates:
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return Path(candidates[0])
+    return None
+
+
+def analyze_transcript(tpath: Path | None, max_summary_len: int = 115) -> dict[str, Any]:
+    res: dict[str, Any] = {
+        "vel_in": None,
+        "vel_out": None,
+        "prefill_s": None,
+        "out_s": None,
+        "total_s": None,
+        "speed_str": PLACEHOLDER_SPEED,
+        "task_summary": "",
+        "is_completed_task": False,
+        "ctx_in_tokens": 0,
+        "last_out_tokens": 0,
+        "turn_out_tokens": 0,
+        "last_step_ts": None,
+    }
+    if not tpath or not tpath.is_file():
+        return res
+
+    try:
+        mtime = tpath.stat().st_mtime
+        size = tpath.stat().st_size
+        with tpath.open("rb") as fh:
+            fh.seek(max(0, size - 655360))
+            raw_tail = fh.read().decode("utf-8", errors="ignore").splitlines()
+    except Exception:
+        return res
+
+    steps: list[dict[str, Any]] = []
+    for line in raw_tail:
+        s = line.strip()
+        if not s.startswith("{"):
+            continue
+        try:
+            steps.append(json.loads(s))
+        except Exception:
+            continue
+
+    if not steps:
+        return res
+
+    last_user_prompt = ""
+    last_final_response = ""
+    prev_completed_response = ""
+    last_planner_idx = -1
+    turn_out_acc = 0
+
+    for i, st in enumerate(steps):
+        stype = st.get("type", "")
+        if stype == "USER_INPUT":
+            u = clean_task_summary(str(st.get("content") or ""), max_summary_len)
+            if u:
+                last_user_prompt = u
+                if last_final_response:
+                    prev_completed_response = last_final_response
+                last_final_response = ""
+                turn_out_acc = 0
+        elif stype == "PLANNER_RESPONSE":
+            last_planner_idx = i
+            turn_out_acc += int(st.get("output_tokens") or 0)
+            tool_calls = st.get("tool_calls")
+            content = str(st.get("content") or "").strip()
+            if content and not tool_calls:
+                c = clean_task_summary(content, max_summary_len)
+                if c:
+                    last_final_response = c
+                    prev_completed_response = c
+
+    # Preferisci sempre il riassunto di fine task dell'ultima risposta conclusa;
+    # se un nuovo turno è in corso, mostra l'ultimo riassunto concluso o la richiesta attuale
+    if last_final_response:
+        res["is_completed_task"] = True
+        res["task_summary"] = last_final_response
+    elif prev_completed_response:
+        res["is_completed_task"] = True
+        res["task_summary"] = prev_completed_response
+    elif last_user_prompt:
+        res["task_summary"] = last_user_prompt
+
+    if last_planner_idx >= 0:
+        pst = steps[last_planner_idx]
+        fresh_in = int(pst.get("input_tokens") or 0)
+        cached_in = int(pst.get("cache_read_tokens") or 0)
+        in_tok = fresh_in + cached_in
+        out_tok = int(pst.get("output_tokens") or 0)
+        res["ctx_in_tokens"] = in_tok
+        res["last_out_tokens"] = out_tok
+        res["turn_out_tokens"] = max(out_tok, turn_out_acc)
+
+        t0 = parse_iso_ts(str(pst.get("created_at") or ""))
+        t1 = None
+        if last_planner_idx + 1 < len(steps):
+            t1 = parse_iso_ts(str(steps[last_planner_idx + 1].get("created_at") or ""))
+        if t1 is None or (t0 is not None and t1 <= t0):
+            t1 = mtime
+
+        if t0 is not None and t1 is not None and t1 >= t0:
+            dt_step = max(0.4, min(180.0, t1 - t0))
+        else:
+            dt_step = max(1.0, (cached_in / 45000.0) + (fresh_in / 8000.0) + (out_tok / 95.0))
+
+        est_pre = max(0.15, (cached_in / 45000.0) + (fresh_in / 8000.0))
+        est_out = max(0.15, out_tok / 95.0)
+        tot_est = est_pre + est_out
+        if tot_est > 0:
+            prefill_s = dt_step * (est_pre / tot_est)
+            prefill_s = max(0.1, min(dt_step - 0.1, prefill_s))
+            out_s = max(0.1, dt_step - prefill_s)
+        else:
+            prefill_s = dt_step * 0.4
+            out_s = dt_step * 0.6
+
+        vel_in = round(in_tok / prefill_s, 1) if in_tok > 0 and prefill_s > 0 else 0.0
+        vel_out = round(out_tok / out_s, 1) if out_tok > 0 and out_s > 0 else 0.0
+
+        res["vel_in"] = vel_in
+        res["vel_out"] = vel_out
+        res["prefill_s"] = round(prefill_s, 1)
+        res["out_s"] = round(out_s, 1)
+        res["total_s"] = round(dt_step, 1)
+        if vel_in > 0 or vel_out > 0:
+            in_part = f"↓{fmt_rate(vel_in)}/s({fmt_sec(prefill_s)})" if vel_in > 0 else f"↓–({fmt_sec(prefill_s)})"
+            out_part = f"↑{fmt_rate(vel_out)}/s({fmt_sec(out_s)})" if vel_out > 0 else f"↑–({fmt_sec(out_s)})"
+            res["speed_str"] = f"{in_part} {out_part}"
+
+    last_ts = parse_iso_ts(str(steps[-1].get("created_at") or ""))
+    res["last_step_ts"] = last_ts
+    return res
+
+
+def build_context_bar(used_pct: float, bar_width: int = 8) -> str:
+    pct_int = max(0, min(100, int(round(used_pct))))
+    filled = min(bar_width, (pct_int * bar_width) // 100)
+    empty = bar_width - filled
+    bar = ("█" * filled) + ("░" * empty)
+    return f"{bar} {pct_int}%"
+
+
+def extract_deduplicated_quota(quota_obj: dict[str, Any], model_str: str) -> str:
+    """Estrae una sola coppia 5h e 7d corrispondente alla famiglia del modello attivo,
+    eliminando la duplicazione tra bucket 'Claude and GPT models' e 'Gemini Models'.
+    """
+    if not isinstance(quota_obj, dict) or not quota_obj:
+        return ""
+    m_low = model_str.lower()
+    is_gemini = any(k in m_low for k in ("argon", "gemini", "flash", "pro", "agy"))
+    is_claude = any(k in m_low for k in ("claude", "sonnet", "opus", "haiku", "gpt"))
+
+    best: dict[str, tuple[int, int]] = {}
+    for qk, qv in quota_obj.items():
+        if not isinstance(qv, dict):
+            continue
+        rem = qv.get("remaining_fraction")
+        if rem is None:
+            continue
+        try:
+            used_q = max(0, min(100, int(round((1.0 - float(rem)) * 100.0))))
+        except Exception:
+            continue
+        desc = f"{qk} {qv.get('display_name', '')} {qv.get('description', '')}".lower()
+        if any(w in desc for w in ("7d", "week", "7-day", "7_day")):
+            label = "7d"
+        elif any(w in desc for w in ("5h", "hour", "5-hour", "5_hour", "5hr")):
+            label = "5h"
+        else:
+            label = "q"
+
+        prio = 0
+        if is_gemini:
+            if "gemini" in desc or "argon" in desc:
+                prio = 2
+            elif "claude" in desc or "gpt" in desc:
+                prio = -2
+        elif is_claude:
+            if "claude" in desc or "gpt" in desc:
+                prio = 2
+            elif "gemini" in desc or "argon" in desc:
+                prio = -2
+
+        cand = (prio, used_q)
+        if label not in best or cand > best[label]:
+            best[label] = cand
+
+    parts: list[str] = []
+    for lbl in ("5h", "7d", "q"):
+        if lbl in best:
+            parts.append(f"{lbl}:{best[lbl][1]}%")
+    return " ".join(parts)
+
+
+def main() -> int:
+    raw = ""
+    try:
+        if select.select([sys.stdin], [], [], 1.5)[0]:
+            raw = sys.stdin.read()
+    except Exception:
+        raw = ""
+
+    data: dict[str, Any] = {}
+    if raw.strip():
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+
+    model_str = shorten_model(data.get("model"))
+    session_id = str(data.get("conversation_id") or data.get("session_id") or "").strip()
+    workspace = data.get("workspace") if isinstance(data.get("workspace"), dict) else {}
+    cwd_val = str(workspace.get("current_dir") or data.get("cwd") or os.getcwd()).strip()
+    agent_state = str(data.get("agent_state") or "idle").strip().lower()
+    term_width = int(data.get("terminal_width") or 129)
+    if term_width < 60:
+        term_width = 129
+    max_line2_summary = max(36, term_width - 18)
+
+    tpath = find_transcript_path(data)
+    tinfo = analyze_transcript(tpath, max_summary_len=max_line2_summary)
+
+    # ── Context Window in Entrata (in) e in Uscita (out) ──────────────────────
+    cw = data.get("context_window") if isinstance(data.get("context_window"), dict) else {}
+    in_ctx_max = int(cw.get("context_window_size") or DEFAULT_IN_CTX_MAX)
+    out_ctx_max = int(cw.get("max_output_tokens") or DEFAULT_OUT_CTX_MAX)
+
+    cur_u = cw.get("current_usage") if isinstance(cw.get("current_usage"), dict) else {}
+    cur_in = (
+        int(cur_u.get("input_tokens") or 0)
+        + int(cur_u.get("cache_read_input_tokens") or 0)
+        + int(cur_u.get("cache_creation_input_tokens") or 0)
+    )
+    if cur_in <= 0:
+        cur_in = int(tinfo.get("ctx_in_tokens") or cw.get("total_input_tokens") or 0)
+
+    cur_out = int(cur_u.get("output_tokens") or 0)
+    if cur_out <= 0:
+        cur_out = int(tinfo.get("last_out_tokens") or 0)
+
+    tot_out = int(cw.get("total_output_tokens") or tinfo.get("turn_out_tokens") or cur_out)
+
+    used_pct = float(cw.get("used_percentage") or 0.0)
+    if used_pct <= 0.0 and cur_in > 0 and in_ctx_max > 0:
+        used_pct = (cur_in * 100.0) / in_ctx_max
+    ctx_bar = build_context_bar(used_pct, bar_width=8)
+
+    in_str = f"in:{fmt_tokens(cur_in)}/{fmt_tokens(in_ctx_max)}"
+    if tot_out > cur_out and tot_out >= 10_000:
+        out_str = f"out:{fmt_tokens(cur_out, precise_small_k=True)}/{fmt_tokens(out_ctx_max)}(Σ{fmt_tokens(tot_out)})"
+    else:
+        out_str = f"out:{fmt_tokens(cur_out, precise_small_k=True)}/{fmt_tokens(out_ctx_max)}"
+    io_stat = f"{in_str} {out_str}"
+
+    # ── Velocità di prefill e output in secondi ───────────────────────────────
+    speed_seg = str(tinfo.get("speed_str") or PLACEHOLDER_SPEED)
+    if agent_state in ("working", "tool_use") and tinfo.get("last_step_ts"):
+        elapsed_live = max(0.0, time.time() - float(tinfo["last_step_ts"]))
+        if 1.0 <= elapsed_live < 600.0:
+            speed_seg = f"{speed_seg} ⏳{elapsed_live:.0f}s"
+
+    # ── Quota deduplicata (una sola 5h e una sola 7d) & Costo ─────────────────
+    quota_obj = data.get("quota") if isinstance(data.get("quota"), dict) else {}
+    rate_stat = extract_deduplicated_quota(quota_obj, model_str)
+
+    cost_obj = data.get("cost") if isinstance(data.get("cost"), dict) else {}
+    cost_usd = float(cost_obj.get("total_usd") or cost_obj.get("total_cost_usd") or 0.0)
+    cost_seg = f"${cost_usd:.2f}"
+
+    # ── Riassunto fine task & Flotta-bus ──────────────────────────────────────
+    task_summary = str(tinfo.get("task_summary") or "").strip()
+
+    flotta_seg = ""
+    if os.path.isfile(FLOTTA_BUS):
+        agent_name = "argon" if "argon" in model_str or "argon" in os.environ.get("HOME", "") else "agy"
+        cmd_reg = [
+            FLOTTA_BUS,
+            "registra",
+            "--agente",
+            agent_name,
+            "--modello",
+            model_str,
+            "--cwd",
+            cwd_val,
+            "--vel-str",
+            str(tinfo.get("speed_str") or PLACEHOLDER_SPEED),
+        ]
+        if session_id:
+            cmd_reg += ["--sessione", session_id]
+        if tinfo.get("vel_in") is not None:
+            cmd_reg += ["--vel-in", str(tinfo["vel_in"])]
+        if tinfo.get("vel_out") is not None:
+            cmd_reg += ["--vel-out", str(tinfo["vel_out"])]
+        if task_summary:
+            cmd_reg += ["--riassunto", task_summary[:160]]
+        try:
+            subprocess.Popen(cmd_reg, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        try:
+            fb = subprocess.run(
+                [FLOTTA_BUS, "barra", "--max-riassunto", str(max_line2_summary)],
+                capture_output=True,
+                text=True,
+                timeout=0.7,
+                check=False,
+            )
+            if fb.returncode == 0 and fb.stdout.strip():
+                flotta_seg = fb.stdout.strip()
+        except Exception:
+            pass
+
+    if not flotta_seg and task_summary:
+        short_s = (
+            task_summary[: max_line2_summary - 1].rstrip() + "…"
+            if len(task_summary) > max_line2_summary
+            else task_summary
+        )
+        flotta_seg = f"ult:{dt.datetime.now():%H:%M} │ {short_s}"
+
+    now_time = dt.datetime.now().strftime("%H:%M")
+
+    # ── Colori ANSI ───────────────────────────────────────────────────────────
+    C = "\033[36m"
+    P = "\033[38;2;203;166;247m"
+    R = "\033[0m"
+
+    def _vis_len(s: str) -> int:
+        return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+    def _make_line1(bw: int, spd: str) -> str:
+        segs = [
+            f"{C}{model_str}",
+            build_context_bar(used_pct, bar_width=bw),
+            io_stat,
+            f"{P}{spd}{C}",
+        ]
+        if rate_stat:
+            segs.append(rate_stat)
+        segs.append(cost_seg)
+        segs.append(f"{now_time}{R}")
+        return " │ ".join(segs)
+
+    line1 = _make_line1(7, speed_seg)
+    if _vis_len(line1) > term_width - 1:
+        line1 = _make_line1(5, speed_seg)
+    if _vis_len(line1) > term_width - 1 and " ⏳" in speed_seg:
+        line1 = _make_line1(5, speed_seg.split(" ⏳", 1)[0])
+
+    if flotta_seg:
+        line2 = f"{C}↳ {flotta_seg}{R}"
+        print(f"{line1}\n{line2}")
+    else:
+        print(line1)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        print(f"argon.4 │ {PLACEHOLDER_SPEED} │ {dt.datetime.now():%H:%M}")
+        raise SystemExit(0)

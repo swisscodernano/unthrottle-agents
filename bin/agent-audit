@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+agent-audit — Cross-platform diagnostic & unthrottling scanner for AI Coding Agents.
+Supports: Google Antigravity (Argon), OpenAI Codex CLI, Claude Code, Pi Agent, and llama.cpp.
+Zero external dependencies (Python 3.9+ standard library).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import sys
+import urllib.request
+from pathlib import Path
+
+BOLD = "\033[1m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+CYAN = "\033[36m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+
+def status_badge(level: str) -> str:
+    if level == "OK":
+        return f"{GREEN}[UNLOCKED]{RESET}"
+    if level == "WARN":
+        return f"{YELLOW}[THROTTLED]{RESET}"
+    return f"{RED}[BROKEN]{RESET}"
+
+
+def check_antigravity(home: Path) -> list[tuple[str, str, str]]:
+    results: list[tuple[str, str, str]] = []
+    candidates = [
+        home / ".local" / "bin" / "agy-bin",
+        Path("/Applications/Antigravity.app/Contents/Resources/app/bin/agy-bin"),
+    ]
+    w = shutil.which("agy-bin")
+    if w:
+        candidates.insert(0, Path(w))
+    binary = next((p for p in candidates if p.is_file()), None)
+    if not binary:
+        results.append(("Antigravity (agy-bin)", "WARN", "Binary not found in standard paths"))
+        return results
+
+    try:
+        data = binary.read_bytes()
+    except Exception as exc:
+        results.append(("Antigravity (agy-bin)", "ERR", f"Cannot read {binary}: {exc}"))
+        return results
+
+    # Check 1: Output token cap & Orchestrator 1M continuation
+    x86_patched_out = (
+        bytes.fromhex("81f900000100ba000001000f42d185c9b900000100") in data
+        and bytes.fromhex("ba00001000eb32904885c97406488b5128eb0231d24885d27409") in data
+    )
+    arm_patched_out = b"\x28\x00\xa0\x52\x08\x01\x00\xf9" in data
+    if x86_patched_out or arm_patched_out:
+        results.append((
+            "Antigravity Output Window",
+            "OK",
+            f"64k/leg + 1,048,576 (1M) Orchestrator ceiling active in {binary.name}",
+        ))
+    else:
+        results.append((
+            "Antigravity Output Window",
+            "WARN",
+            "Hardcoded 16,384 (0x4000) output cap detected (98.4% of 1M output unused)",
+        ))
+
+    # Check 2: Input context compaction threshold (GetCheckpointConfig)
+    x86_patched_ctx = bytes.fromhex("8b54244c81faf07e0e00bef07e0e000f42f289742450") in data
+    arm_patched_ctx = b"\x01\xde\x9f\x52\xc1\x01\xa0\x72\x22\x00\xa0\x52" in data
+    if x86_patched_ctx or arm_patched_ctx:
+        results.append((
+            "Antigravity Input Compaction",
+            "OK",
+            "Compacts at 950,000 / 1,048,576 tokens (90.6% window) with 64k checkpoint summary",
+        ))
+    elif bytes.fromhex("8b54244c81fa00e80300be00e803000f42f289742450") in data:
+        results.append((
+            "Antigravity Input Compaction",
+            "WARN",
+            "Compacts early at 256,000 / 1,048,576 tokens (0x3e800 — 75% of 1M window wasted)",
+        ))
+
+    # Check 3: hooks.json schema trap
+    hooks_file = home / ".gemini" / "config" / "hooks.json"
+    if hooks_file.is_file():
+        try:
+            hdata = json.loads(hooks_file.read_text(encoding="utf-8"))
+            top_hooks = hdata.get("hooks")
+            if isinstance(top_hooks, dict) and any(
+                isinstance(v, list) and v and isinstance(v[0], dict) and "hooks" in v[0]
+                for k, v in top_hooks.items()
+                if k in ("SessionStart", "PreInvocation", "Stop")
+            ):
+                results.append((
+                    "Antigravity hooks.json",
+                    "ERR",
+                    "Claude-style nested 'hooks' array inside SessionStart/PreInvocation/Stop silently breaks Go parser",
+                ))
+            else:
+                results.append(("Antigravity hooks.json", "OK", f"Valid flat handler schema in {hooks_file}"))
+        except Exception as exc:
+            results.append(("Antigravity hooks.json", "ERR", f"Invalid JSON: {exc}"))
+
+    return results
+
+
+def check_codex(home: Path) -> list[tuple[str, str, str]]:
+    results: list[tuple[str, str, str]] = []
+    cfg = home / ".codex" / "config.toml"
+    if not cfg.is_file():
+        results.append(("OpenAI Codex CLI", "WARN", "~/.codex/config.toml not found"))
+        return results
+    text = cfg.read_text(encoding="utf-8", errors="ignore")
+    has_ctx = "model_context_window" in text and "1000000" in text
+    has_compact = "model_auto_compact_token_limit" in text and ("900000" in text or "950000" in text)
+    has_tool_out = "tool_output_token_limit" in text and ("65536" in text or "64000" in text)
+    if has_ctx and has_compact and has_tool_out:
+        results.append((
+            "OpenAI Codex CLI Limits",
+            "OK",
+            "1M context + 950k auto-compact + 64k tool_output_token_limit active",
+        ))
+    else:
+        missing = []
+        if not has_ctx:
+            missing.append("model_context_window=1000000")
+        if not has_compact:
+            missing.append("model_auto_compact_token_limit=900000")
+        if not has_tool_out:
+            missing.append("tool_output_token_limit=65536 (default is 10,000!)")
+        results.append(("OpenAI Codex CLI Limits", "WARN", "Missing: " + ", ".join(missing)))
+    return results
+
+
+def check_pi(home: Path) -> list[tuple[str, str, str]]:
+    results: list[tuple[str, str, str]] = []
+    settings_path = home / ".pi" / "agent" / "settings.json"
+    if not settings_path.is_file():
+        results.append(("Pi Coding Agent", "WARN", "~/.pi/agent/settings.json not found"))
+        return results
+    try:
+        s = json.loads(settings_path.read_text(encoding="utf-8"))
+        tb_high = (s.get("thinkingBudgets") or {}).get("high", 16384)
+        comp_res = (s.get("compaction") or {}).get("reserveTokens", 16384)
+        if tb_high >= 65536 and comp_res >= 50000:
+            results.append((
+                "Pi Coding Agent",
+                "OK",
+                f"thinkingBudgets.high={tb_high} (4x default) & compaction.reserveTokens={comp_res} (950k/1M threshold)",
+            ))
+        else:
+            results.append((
+                "Pi Coding Agent",
+                "WARN",
+                f"thinkingBudgets.high={tb_high} (default 16384), compaction.reserveTokens={comp_res}",
+            ))
+    except Exception as exc:
+        results.append(("Pi Coding Agent", "ERR", f"Cannot parse settings.json: {exc}"))
+    return results
+
+
+def check_llama_local() -> list[tuple[str, str, str]]:
+    url = os.environ.get("PI_LOCALE_ROUTER", "http://127.0.0.1:5569") + "/v1/models"
+    try:
+        with urllib.request.urlopen(url, timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = data.get("data") or []
+            if models:
+                m = models[0]
+                mid = m.get("id", "unknown")
+                return [("Local llama.cpp Router", "OK", f"Online at {url} ({mid})")]
+    except Exception:
+        pass
+    return []
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Audit hidden context & output throttles across AI coding agents.")
+    parser.add_argument("--json", action="store_true", help="Output results as JSON")
+    args = parser.parse_args()
+
+    real_home = Path(os.environ.get("HOME", "~")).expanduser()
+    if ".agy-account" in str(real_home):
+        real_home = Path(str(real_home).split("/.agy-account")[0])
+
+    checks: list[tuple[str, str, str]] = []
+    checks.extend(check_antigravity(real_home))
+    checks.extend(check_codex(real_home))
+    checks.extend(check_pi(real_home))
+    checks.extend(check_llama_local())
+
+    if args.json:
+        print(json.dumps([{"component": c, "status": s, "detail": d} for c, s, d in checks], indent=2))
+        return 0
+
+    print(f"\n{BOLD}{CYAN}⚡ UNTHROTTLE-AGENTS — AI Coding Agent Context & Output Audit{RESET}")
+    print(f"{DIM}Platform: {platform.system()} {platform.machine()} | Home: {real_home}{RESET}\n")
+    for comp, st, detail in checks:
+        print(f"  {status_badge(st):<22} {BOLD}{comp:<30}{RESET} {detail}")
+    print(
+        f"\n{DIM}Companion architecture & research from «SUPER INTELLIGENCE» (2026) — https://github.com/aiagens/unthrottle-agents{RESET}\n"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

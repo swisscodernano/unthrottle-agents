@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -181,6 +182,34 @@ def check_llama_local() -> list[tuple[str, str, str]]:
     return []
 
 
+def check_agent_coord(home: Path) -> list[tuple[str, str, str]]:
+    coord_bin = Path(__file__).resolve().parent / "agent-coord"
+    if not coord_bin.is_file():
+        return [("Fleet Anti-Collision (agent-coord)", "WARN", "bin/agent-coord not found")]
+    if not os.access(coord_bin, os.X_OK):
+        return [("Fleet Anti-Collision (agent-coord)", "WARN", f"{coord_bin} is not executable (run chmod +x)")]
+    try:
+        res = subprocess.run(
+            [sys.executable, str(coord_bin), "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=2.5,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            payload = json.loads(res.stdout)
+            n_sess = len(payload.get("sessions") or [])
+            n_claims = len(payload.get("claims") or [])
+            return [(
+                "Fleet Anti-Collision (agent-coord)",
+                "OK",
+                f"Active (flock + PID birth guard) — {n_sess} active session(s), {n_claims} file claim(s)",
+            )]
+    except Exception as exc:
+        return [("Fleet Anti-Collision (agent-coord)", "ERR", f"Execution error: {exc}")]
+    return [("Fleet Anti-Collision (agent-coord)", "OK", f"Executable ready at {coord_bin}")]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Audit hidden context & output throttles across AI coding agents.")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
@@ -195,6 +224,7 @@ def main() -> int:
     checks.extend(check_codex(real_home))
     checks.extend(check_pi(real_home))
     checks.extend(check_llama_local())
+    checks.extend(check_agent_coord(real_home))
 
     if args.json:
         print(json.dumps([{"component": c, "status": s, "detail": d} for c, s, d in checks], indent=2))
@@ -203,9 +233,9 @@ def main() -> int:
     print(f"\n{BOLD}{CYAN}⚡ UNTHROTTLE-AGENTS — AI Coding Agent Context & Output Audit{RESET}")
     print(f"{DIM}Platform: {platform.system()} {platform.machine()} | Home: {real_home}{RESET}\n")
     for comp, st, detail in checks:
-        print(f"  {status_badge(st):<22} {BOLD}{comp:<30}{RESET} {detail}")
+        print(f"  {status_badge(st):<22} {BOLD}{comp:<34}{RESET} {detail}")
     print(
-        f"\n{DIM}Companion architecture & research from «SUPER INTELLIGENCE» (2026) — https://github.com/aiagens/unthrottle-agents{RESET}\n"
+        f"\n{DIM}Companion architecture & research from «SUPER INTELLIGENCE» (2026) — https://a.co/d/0gO1eMZX | https://github.com/aiagens/unthrottle-agents{RESET}\n"
     )
     return 0
 

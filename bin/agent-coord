@@ -1,0 +1,1109 @@
+#!/usr/bin/env python3
+"""
+agent-coord — Standalone, zero-dependency multi-agent anti-collision & fleet coordination CLI.
+Completes Phase P5 of the open-source extraction design (Linux & macOS compatible).
+
+Provides:
+  1. Atomic file/directory claim & PreToolUse guard (`claim`, `guard`, `check`, `release`)
+     with fcntl.flock mutual exclusion, prefix-overlap detection, git worktree root
+     tracking, and PID liveness + birth-time verification (/proc/<pid>/stat on Linux,
+     `ps -o lstart= -p <pid>` on macOS) to eliminate stale locks after crashes or PID reuse.
+  2. Real-time fleet telemetry registry (`register`/`registra`, `status`/`quadro`,
+     `bar`/`barra`, `context`/`contesto`) tracking prefill (↓) and decode (↑) speeds,
+     branches, and end-of-task summaries across concurrent CLI coding agents.
+  3. Inter-session messaging bus (`send`/`invia`, `inbox`/`leggi`).
+
+State directory: $AGENT_COORD_DIR or ~/.agent-coord/ (sessions/, claims/, messages/, .guard.lock)
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+TTL_CLAIM_MANUAL = 6 * 3600   # 6 hours for explicit manual claims
+TTL_CLAIM_AUTO = 45 * 60      # 45 minutes for automatic PreToolUse hook claims
+AGENT_COMM_NAMES = {
+    "claude",
+    "codex",
+    "gemini",
+    "agy",
+    "agy-bin",
+    "argon",
+    "pi",
+    "node",
+    "python3",
+}
+
+
+def get_coord_dir() -> Path:
+    env_dir = os.environ.get("AGENT_COORD_DIR", "").strip()
+    if env_dir:
+        base = Path(env_dir).expanduser()
+    else:
+        real_home = os.environ.get("HOME", "~")
+        if "/.agy-account/" in real_home:
+            real_home = real_home.split("/.agy-account/")[0]
+        base = Path(real_home).expanduser() / ".agent-coord"
+    for sub in ("sessions", "claims", "messages", "seen"):
+        try:
+            (base / sub).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return base
+
+
+def _now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def _safe_key(raw: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "_", (raw or "").strip())
+    return cleaned[:80] or "default"
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+@contextlib.contextmanager
+def _flock_guard(coord_dir: Path):
+    coord_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = coord_dir / ".guard.lock"
+    with open(lock_file, "w", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _get_pid_birth(pid: int) -> str | None:
+    """Return a deterministic birth-time token for `pid`, or None if the process does not exist.
+    Uses /proc/<pid>/stat field 22 on Linux and `ps -o lstart= -p <pid>` on macOS/BSD.
+    """
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.is_file():
+        try:
+            raw = proc_stat.read_text(encoding="utf-8", errors="ignore")
+            after_comm = raw.rsplit(") ", 1)[1].split()
+            # Field 22 in /proc/pid/stat is index 19 after the closing paren of comm
+            if len(after_comm) > 19:
+                return f"linux:{after_comm[19]}"
+        except Exception:
+            pass
+
+    if platform.system() in ("Darwin", "FreeBSD", "OpenBSD", "NetBSD"):
+        try:
+            res = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+            out = res.stdout.strip()
+            if res.returncode == 0 and out:
+                return f"ps:{out}"
+        except Exception:
+            pass
+
+    return "alive"
+
+
+def _is_holder_alive(pid: int | None, expected_birth: str | None) -> bool:
+    if not pid or int(pid) <= 0:
+        return True
+    cur_birth = _get_pid_birth(int(pid))
+    if cur_birth is None:
+        return False
+    if expected_birth and expected_birth != "alive" and cur_birth != "alive":
+        return cur_birth == expected_birth
+    return True
+
+
+def _find_agent_ancestor_pid() -> int:
+    """Walk up the process tree to find the long-lived agent harness PID rather than an ephemeral subshell."""
+    pid = os.getpid()
+    best_pid = os.getppid()
+    for _ in range(16):
+        if pid <= 1:
+            break
+        proc_stat = Path(f"/proc/{pid}/stat")
+        proc_comm = Path(f"/proc/{pid}/comm")
+        if proc_stat.is_file() and proc_comm.is_file():
+            try:
+                comm = proc_comm.read_text(encoding="utf-8", errors="ignore").strip().lower()
+                after = proc_stat.read_text(encoding="utf-8", errors="ignore").rsplit(") ", 1)[1].split()
+                ppid = int(after[1])
+                if comm in AGENT_COMM_NAMES:
+                    best_pid = pid
+                    if comm in ("claude", "codex", "gemini", "agy", "agy-bin", "argon", "pi"):
+                        return pid
+                if ppid <= 1 or ppid == pid:
+                    break
+                pid = ppid
+                continue
+            except Exception:
+                break
+        elif platform.system() == "Darwin":
+            try:
+                res = subprocess.run(
+                    ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0,
+                    check=False,
+                )
+                line = res.stdout.strip()
+                if not line:
+                    break
+                parts = line.split(None, 1)
+                ppid = int(parts[0])
+                comm = os.path.basename(parts[1]).lower() if len(parts) > 1 else ""
+                if comm in AGENT_COMM_NAMES:
+                    best_pid = pid
+                    if comm in ("claude", "codex", "gemini", "agy", "agy-bin", "argon", "pi"):
+                        return pid
+                if ppid <= 1 or ppid == pid:
+                    break
+                pid = ppid
+                continue
+            except Exception:
+                break
+        break
+    return best_pid
+
+
+def _git_toplevel(cwd: str | None = None) -> str | None:
+    work_dir = cwd or os.getcwd()
+    if not os.path.isdir(work_dir):
+        return None
+    try:
+        res = subprocess.run(
+            ["git", "-C", work_dir, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        out = res.stdout.strip()
+        if res.returncode == 0 and out:
+            return os.path.realpath(out)
+    except Exception:
+        pass
+    return None
+
+
+def _detect_branch(cwd: str | None = None) -> str:
+    work_dir = cwd or os.getcwd()
+    if not os.path.isdir(work_dir):
+        return ""
+    try:
+        res = subprocess.run(
+            ["git", "-C", work_dir, "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+        res2 = subprocess.run(
+            ["git", "-C", work_dir, "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+        if res2.returncode == 0 and res2.stdout.strip():
+            return res2.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _detect_tmux_coords(pane: str = "") -> str:
+    pane = pane or os.environ.get("TMUX_PANE", "").strip()
+    if not pane:
+        return ""
+    try:
+        res = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{session_name}:#{window_index}.#{pane_index}"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+        out = res.stdout.strip()
+        if res.returncode == 0 and out:
+            return out
+    except Exception:
+        pass
+    return pane
+
+
+def _detect_agent(explicit: str = "") -> str:
+    if explicit:
+        return explicit.strip()
+    for env_key in ("AGENT_COORD_AGENT", "FLOTTA_AGENT", "AIAGENS_AGENT", "CLAUDE_AGENT"):
+        if os.environ.get(env_key):
+            return os.environ[env_key].strip()
+    home = os.environ.get("HOME", "")
+    for name in ("argon", "agy1", "agy2", "agy3", "agy4"):
+        if f".agy-account/{name}" in home:
+            return name
+    if os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION"):
+        return "codex"
+    if os.environ.get("MINIMAX_API_KEY") or "minimax" in os.environ.get("ANTHROPIC_BASE_URL", "").lower():
+        return "minimax"
+    if "xiaomimimo" in os.environ.get("ANTHROPIC_BASE_URL", "").lower():
+        return "mimo"
+    return "claude"
+
+
+def _resolve_identity(explicit_session: str = "", explicit_agent: str = "", cwd: str | None = None) -> dict[str, Any]:
+    agent = _detect_agent(explicit_agent)
+    root_path = _git_toplevel(cwd)
+    worktree_name = os.path.basename(root_path) if root_path else None
+    anc_pid = _find_agent_ancestor_pid()
+    pid_birth = _get_pid_birth(anc_pid)
+
+    base_session = (
+        explicit_session.strip()
+        or os.environ.get("AGENT_COORD_SESSION", "").strip()
+        or os.environ.get("AIAGENS_SESSION", "").strip()
+        or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+        or os.environ.get("CODEX_THREAD_ID", "").strip()
+        or os.environ.get("CODEX_SESSION", "").strip()
+        or os.environ.get("TMUX_PANE", "").strip()
+        or f"{socket.gethostname()}:{anc_pid}"
+    )
+    if worktree_name and f"@{worktree_name}" not in base_session and not explicit_session:
+        session_id = f"{base_session}@{worktree_name}"
+    else:
+        session_id = base_session
+
+    return {
+        "agent": agent,
+        "session": session_id,
+        "pid": anc_pid,
+        "pid_birth": pid_birth,
+        "root_path": root_path or os.path.abspath(cwd or os.getcwd()),
+        "branch": _detect_branch(cwd),
+    }
+
+
+def _normalize_paths(raw_paths: list[str], root_path: str | None = None) -> list[str]:
+    normed: set[str] = set()
+    top = root_path or _git_toplevel()
+    for p in raw_paths:
+        s = str(p or "").strip()
+        if not s:
+            continue
+        if top:
+            try:
+                abs_p = os.path.realpath(s if os.path.isabs(s) else os.path.join(os.getcwd(), s))
+                if abs_p == top:
+                    rel = "."
+                elif abs_p.startswith(top.rstrip("/") + "/"):
+                    rel = os.path.relpath(abs_p, top)
+                else:
+                    rel = s.lstrip("./").rstrip("/")
+            except Exception:
+                rel = s.lstrip("./").rstrip("/")
+        else:
+            rel = s.lstrip("./").rstrip("/")
+        if rel:
+            normed.add(rel.replace("\\", "/"))
+    return sorted(normed)
+
+
+def _overlapping_paths(paths_a: list[str], paths_b: list[str]) -> list[str]:
+    overlaps: list[str] = []
+    for x in paths_a:
+        x_clean = x.rstrip("/")
+        for y in paths_b:
+            y_clean = y.rstrip("/")
+            if (
+                x_clean == y_clean
+                or x_clean == "."
+                or y_clean == "."
+                or x_clean.startswith(y_clean + "/")
+                or y_clean.startswith(x_clean + "/")
+            ):
+                overlaps.append(x)
+                break
+    return overlaps
+
+
+def _claim_file_for(coord_dir: Path, session_id: str) -> Path:
+    return coord_dir / "claims" / f"{_safe_key(session_id)}.json"
+
+
+def _load_active_claims(coord_dir: Path, purge_expired: bool = True) -> list[dict[str, Any]]:
+    claims_dir = coord_dir / "claims"
+    if not claims_dir.is_dir():
+        return []
+    now = time.time()
+    active: list[dict[str, Any]] = []
+    for f in sorted(claims_dir.glob("*.json")):
+        d = _read_json(f)
+        if not d:
+            continue
+        updated = float(d.get("updated_at") or d.get("aggiornato") or 0)
+        ttl = float(d.get("ttl") or TTL_CLAIM_MANUAL)
+        expired_ttl = (now - updated) >= ttl
+        holder_alive = _is_holder_alive(d.get("pid"), d.get("pid_birth"))
+        if expired_ttl or not holder_alive:
+            if purge_expired:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            continue
+        d["_file"] = str(f)
+        active.append(d)
+    return active
+
+
+def _find_conflicts(
+    coord_dir: Path,
+    ident: dict[str, Any],
+    norm_paths: list[str],
+) -> list[tuple[dict[str, Any], list[str]]]:
+    conflicts: list[tuple[dict[str, Any], list[str]]] = []
+    my_session = ident["session"]
+    my_root = ident.get("root_path")
+    for claim in _load_active_claims(coord_dir):
+        if claim.get("session") == my_session:
+            continue
+        other_root = claim.get("root_path")
+        # Claims in completely unrelated repositories do not collide unless they share the repo/worktree name
+        if my_root and other_root and os.path.basename(my_root) != os.path.basename(other_root):
+            continue
+        common = _overlapping_paths(norm_paths, claim.get("paths") or claim.get("percorsi") or [])
+        if common:
+            conflicts.append((claim, common))
+    return conflicts
+
+
+def _extract_paths_from_stdin_hook() -> list[str]:
+    if sys.stdin.isatty():
+        return []
+    try:
+        raw = sys.stdin.read().strip()
+        if not raw.startswith("{"):
+            return []
+        payload = json.loads(raw)
+        tool_in = payload.get("tool_input") or payload.get("toolArgs") or payload.get("input") or {}
+        if isinstance(tool_in, str):
+            try:
+                tool_in = json.loads(tool_in)
+            except Exception:
+                tool_in = {}
+        if not isinstance(tool_in, dict):
+            return []
+        paths: list[str] = []
+        for k in ("file_path", "path", "Path", "TargetFile", "target_file", "notebook_path"):
+            val = tool_in.get(k)
+            if isinstance(val, str) and val.strip():
+                paths.append(val.strip())
+        return paths
+    except Exception:
+        return []
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    ident = _resolve_identity(args.session or "", args.agent or "")
+    norm_paths = _normalize_paths(args.paths, ident.get("root_path"))
+    if not norm_paths:
+        print("agent-coord claim: no valid paths provided.", file=sys.stderr)
+        return 1
+
+    ttl = TTL_CLAIM_AUTO if args.auto else TTL_CLAIM_MANUAL
+    with _flock_guard(coord_dir):
+        conflicts = _find_conflicts(coord_dir, ident, norm_paths)
+        if conflicts and not args.anyway:
+            print("CLAIM REJECTED — another active session holds overlapping paths:", file=sys.stderr)
+            for c_data, common in conflicts:
+                age_m = int(max(0.0, time.time() - float(c_data.get("updated_at", 0))) // 60)
+                br = c_data.get("branch") or "-"
+                intent = c_data.get("intent") or ""
+                intent_sfx = f" [{intent}]" if intent else ""
+                print(
+                    f"  • {c_data.get('agent')}/{c_data.get('session')} "
+                    f"(branch: {br}, pid: {c_data.get('pid')}, {age_m}m ago){intent_sfx}: "
+                    f"{', '.join(common)}",
+                    file=sys.stderr,
+                )
+            return 2
+
+        cfile = _claim_file_for(coord_dir, ident["session"])
+        prev = _read_json(cfile)
+        merged_paths = sorted(set((prev.get("paths") or []) + norm_paths))
+        now = time.time()
+        effective_ttl = max(float(prev.get("ttl") or 0), float(ttl)) if prev else float(ttl)
+        record = {
+            "agent": ident["agent"],
+            "session": ident["session"],
+            "pid": ident["pid"],
+            "pid_birth": ident["pid_birth"],
+            "root_path": ident["root_path"],
+            "branch": args.branch or prev.get("branch") or ident["branch"],
+            "intent": args.intent or prev.get("intent") or "",
+            "paths": merged_paths,
+            "created_at": prev.get("created_at") or now,
+            "updated_at": now,
+            "ttl": effective_ttl,
+            "auto": bool(args.auto and not prev.get(" created_manual")),
+            "created_manual": bool(not args.auto or prev.get("created_manual")),
+        }
+        _atomic_write_json(cfile, record)
+        print(
+            f"Claimed {len(record['paths'])} path(s) as {record['agent']}/{record['session']} "
+            f"(branch: {record['branch'] or '-'}, ttl: {int(effective_ttl // 60)}m)"
+        )
+        return 0
+
+
+def cmd_guard(args: argparse.Namespace) -> int:
+    try:
+        raw_paths = list(args.paths or [])
+        if not raw_paths:
+            raw_paths = _extract_paths_from_stdin_hook()
+        if not raw_paths:
+            return 0
+        coord_dir = get_coord_dir()
+        ident = _resolve_identity(args.session or "", args.agent or "")
+        norm_paths = _normalize_paths(raw_paths, ident.get("root_path"))
+        if not norm_paths:
+            return 0
+
+        with _flock_guard(coord_dir):
+            conflicts = _find_conflicts(coord_dir, ident, norm_paths)
+            if conflicts:
+                lines = ["CONFLICT GUARD — file is currently claimed by another active agent session:"]
+                for c_data, common in conflicts:
+                    age_m = int(max(0.0, time.time() - float(c_data.get("updated_at", 0))) // 60)
+                    br = c_data.get("branch") or "-"
+                    intent = c_data.get("intent") or ""
+                    intent_sfx = f" ({intent})" if intent else ""
+                    lines.append(
+                        f"  • {', '.join(common)} → held by {c_data.get('agent')}/{c_data.get('session')} "
+                        f"[branch: {br}, pid: {c_data.get('pid')}, touched {age_m}m ago]{intent_sfx}"
+                    )
+                lines.append("Work on a non-overlapping file, coordinate via `agent-coord send`, or wait for release.")
+                msg = "\n".join(lines)
+                print(msg, file=sys.stderr)
+                return 2
+
+            cfile = _claim_file_for(coord_dir, ident["session"])
+            prev = _read_json(cfile)
+            merged_paths = sorted(set((prev.get("paths") or []) + norm_paths))
+            now = time.time()
+            effective_ttl = max(float(prev.get("ttl") or 0), float(TTL_CLAIM_AUTO))
+            record = {
+                "agent": ident["agent"],
+                "session": ident["session"],
+                "pid": ident["pid"],
+                "pid_birth": ident["pid_birth"],
+                "root_path": ident["root_path"],
+                "branch": prev.get("branch") or ident["branch"],
+                "intent": prev.get("intent") or "auto-guard",
+                "paths": merged_paths,
+                "created_at": prev.get("created_at") or now,
+                "updated_at": now,
+                "ttl": effective_ttl,
+                "auto": True,
+            }
+            _atomic_write_json(cfile, record)
+            return 0
+    except Exception:
+        # Fail-open invariant: a broken hook must never deadlock the developer
+        return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    ident = _resolve_identity(args.session or "", args.agent or "")
+    norm_paths = _normalize_paths(args.paths, ident.get("root_path"))
+    if not norm_paths:
+        return 0
+    conflicts = _find_conflicts(coord_dir, ident, norm_paths)
+    if not conflicts:
+        print(f"FREE: {', '.join(norm_paths)}")
+        return 0
+    for c_data, common in conflicts:
+        age_m = int(max(0.0, time.time() - float(c_data.get("updated_at", 0))) // 60)
+        print(
+            f"HELD: {', '.join(common)} by {c_data.get('agent')}/{c_data.get('session')} "
+            f"(branch: {c_data.get('branch') or '-'}, {age_m}m ago)",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    ident = _resolve_identity(args.session or "", args.agent or "")
+    cfile = _claim_file_for(coord_dir, ident["session"])
+    with _flock_guard(coord_dir):
+        if not cfile.is_file():
+            print(f"No active claims for {ident['session']}.")
+            return 0
+        if not args.paths:
+            try:
+                cfile.unlink()
+            except OSError:
+                pass
+            print(f"Released all claims for {ident['session']}.")
+            return 0
+        prev = _read_json(cfile)
+        norm_to_remove = set(_normalize_paths(args.paths, ident.get("root_path")))
+        remaining = [p for p in (prev.get("paths") or []) if p not in norm_to_remove]
+        if not remaining:
+            try:
+                cfile.unlink()
+            except OSError:
+                pass
+            print(f"Released all claims for {ident['session']}.")
+        else:
+            prev["paths"] = remaining
+            prev["updated_at"] = time.time()
+            _atomic_write_json(cfile, prev)
+            print(f"Released {len(norm_to_remove)} path(s); {len(remaining)} still held by {ident['session']}.")
+    return 0
+
+
+def _resolve_session_key(explicit_key: str = "", session_id: str = "") -> str:
+    if explicit_key:
+        return _safe_key(explicit_key)
+    pane = os.environ.get("TMUX_PANE", "").strip()
+    if pane:
+        return _safe_key(f"pane_{pane.lstrip('%')}")
+    if session_id:
+        return _safe_key(f"sid_{session_id[:20]}")
+    ident = _resolve_identity()
+    return _safe_key(ident["session"])
+
+
+def _clean_summary(text: str, max_len: int = 120) -> str:
+    if not text:
+        return ""
+    m_req = re.search(r"<USER_REQUEST>\s*(.+?)\s*</USER_REQUEST>", text, flags=re.DOTALL)
+    if m_req:
+        text = m_req.group(1)
+    text = re.sub(
+        r"<(task-notification|system-reminder|context_summary|system_message)[^>]*>.*?</\1>",
+        " ",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    cleaned = re.sub(r"<[^>]+>", " ", text)
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    first = re.sub(r"\s+", " ", lines[0]).strip()
+    if len(first) > max_len:
+        return first[: max_len - 1].rstrip() + "…"
+    return first
+
+
+def _format_speed(vel_in: float | int | None, vel_out: float | int | None, fallback: str = "") -> str:
+    parts: list[str] = []
+    if vel_in is not None and float(vel_in) > 0:
+        vi = int(round(float(vel_in)))
+        parts.append(f"↓{vi / 1000:.1f}k/s" if vi >= 1000 else f"↓{vi}/s")
+    else:
+        parts.append("↓--/s")
+    if vel_out is not None and float(vel_out) > 0:
+        vo = int(round(float(vel_out)))
+        parts.append(f"↑{vo / 1000:.1f}k/s" if vo >= 1000 else f"↑{vo}/s")
+    else:
+        parts.append("↑--/s")
+    res = " ".join(parts)
+    if res == "↓--/s ↑--/s" and fallback:
+        return fallback
+    return res
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    pane = (args.pane or os.environ.get("TMUX_PANE", "")).strip()
+    sid = (args.session or "").strip()
+    key = _resolve_session_key(args.key or "", sid)
+    state_file = coord_dir / "sessions" / f"{key}.json"
+    prev = _read_json(state_file)
+
+    now = _now_local()
+    ts = now.timestamp()
+    cwd = (args.cwd or prev.get("cwd") or os.getcwd()).strip()
+    branch = args.branch or _detect_branch(cwd) or prev.get("branch", "")
+    agent = _detect_agent(args.agent or prev.get("agent") or "")
+    model = (args.model or prev.get("model") or "").strip()
+    tmux_coords = _detect_tmux_coords(pane) if pane else prev.get("tmux_target", "")
+
+    summary = _clean_summary(args.summary) if args.summary else prev.get("summary", "")
+    update_task_time = bool(args.summary or args.aggiorna_ora or not prev.get("last_task_ts"))
+    last_task_ts = ts if update_task_time else float(prev.get("last_task_ts", ts))
+    last_task_dt = dt.datetime.fromtimestamp(last_task_ts, tz=now.tzinfo)
+
+    vel_in = args.vel_in if args.vel_in is not None else prev.get("speed_in")
+    vel_out = args.vel_out if args.vel_out is not None else prev.get("speed_out")
+    speed_str = args.vel_str or _format_speed(vel_in, vel_out, fallback=prev.get("speed_str", "↓--/s ↑--/s"))
+
+    record = {
+        "key": key,
+        "pane": pane or prev.get("pane", ""),
+        "tmux_target": tmux_coords,
+        "session_id": sid or prev.get("session_id", ""),
+        "agent": agent,
+        "model": model,
+        "cwd": cwd,
+        "branch": branch,
+        "last_task_ts": last_task_ts,
+        "last_task_ora": last_task_dt.strftime("%H:%M:%S"),
+        "last_task_hm": last_task_dt.strftime("%H:%M"),
+        "last_task_data": last_task_dt.strftime("%H:%M %Z %d/%m/%Y"),
+        "summary": summary or "Active session",
+        "speed_in": vel_in,
+        "speed_out": vel_out,
+        "speed_str": speed_str,
+        "updated_at": ts,
+    }
+    _atomic_write_json(state_file, record)
+
+    # Mirror to legacy flotta-bus directory if present and writable on this host
+    legacy_dir = Path(os.environ.get("AIAGENS_FLOTTA_DIR", "/var/lib/aiagens/sessioni-stato")) / "sessioni"
+    if not os.environ.get("AGENT_COORD_DIR") and legacy_dir.is_dir() and os.access(legacy_dir, os.W_OK):
+        try:
+            _atomic_write_json(legacy_dir / f"{key}.json", record)
+        except Exception:
+            pass
+
+    if args.stampa:
+        print(json.dumps(record, ensure_ascii=False))
+    return 0
+
+
+def _list_active_sessions(coord_dir: Path, max_age_minutes: int = 180) -> list[dict[str, Any]]:
+    cutoff = time.time() - (max_age_minutes * 60)
+    by_key: dict[str, dict[str, Any]] = {}
+
+    search_dirs = [coord_dir / "sessions"]
+    if not os.environ.get("AGENT_COORD_DIR"):
+        legacy = Path(os.environ.get("AIAGENS_FLOTTA_DIR", "/var/lib/aiagens/sessioni-stato")) / "sessioni"
+        if legacy.is_dir():
+            search_dirs.append(legacy)
+
+    for sdir in search_dirs:
+        if not sdir.is_dir():
+            continue
+        for f in sdir.glob("*.json"):
+            data = _read_json(f)
+            if not data:
+                continue
+            upd = float(data.get("updated_at") or 0)
+            if upd < cutoff:
+                continue
+            k = str(data.get("key") or f.stem)
+            if k not in by_key or upd > float(by_key[k].get("updated_at") or 0):
+                by_key[k] = data
+
+    sessions = list(by_key.values())
+    sessions.sort(key=lambda s: float(s.get("last_task_ts") or s.get("updated_at") or 0), reverse=True)
+    return sessions
+
+
+def _collect_unread_messages(
+    coord_dir: Path,
+    key: str,
+    pane: str = "",
+    agent: str = "",
+    coords: str = "",
+    consume: bool = False,
+) -> list[dict[str, Any]]:
+    seen_file = coord_dir / "seen" / f"{key}.json"
+    seen_data = _read_json(seen_file)
+    seen_ids: set[str] = set(seen_data.get("seen_ids", []))
+
+    targets = {key, "all", "tutti"}
+    if pane:
+        targets.add(_safe_key(pane))
+        targets.add(_safe_key(f"pane_{pane.lstrip('%')}"))
+    if agent:
+        targets.add(_safe_key(agent))
+    if coords:
+        targets.add(_safe_key(coords))
+        targets.add(_safe_key(coords.split(":")[0]))
+
+    msg_dirs = [coord_dir / "messages"]
+    if not os.environ.get("AGENT_COORD_DIR"):
+        legacy_msg = Path(os.environ.get("AIAGENS_FLOTTA_DIR", "/var/lib/aiagens/sessioni-stato")) / "messaggi"
+        if legacy_msg.is_dir():
+            msg_dirs.append(legacy_msg)
+
+    unread: list[dict[str, Any]] = []
+    now_ts = time.time()
+    for mdir in msg_dirs:
+        for t in targets:
+            mfile = mdir / f"{t}.jsonl"
+            if not mfile.is_file():
+                continue
+            try:
+                for line in mfile.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if not line.strip():
+                        continue
+                    msg = json.loads(line)
+                    mid = str(msg.get("id") or "")
+                    if not mid or mid in seen_ids:
+                        continue
+                    if msg.get("da_key") == key:
+                        seen_ids.add(mid)
+                        continue
+                    if now_ts - float(msg.get("ts") or 0) > 43200:
+                        seen_ids.add(mid)
+                        continue
+                    unread.append(msg)
+                    if consume:
+                        seen_ids.add(mid)
+            except Exception:
+                continue
+
+    unread.sort(key=lambda m: float(m.get("ts") or 0))
+    if consume and unread:
+        _atomic_write_json(seen_file, {"key": key, "seen_ids": list(seen_ids)[-500:], "updated_at": now_ts})
+    return unread
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    sessions = _list_active_sessions(coord_dir, max_age_minutes=args.active_minutes)
+    claims = _load_active_claims(coord_dir)
+
+    if args.json:
+        print(json.dumps({"sessions": sessions, "claims": claims}, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Active fleet sessions ({len(sessions)}):")
+    if not sessions:
+        print("  (none registered in the last window)")
+    for s in sessions[:35]:
+        coords = s.get("tmux_target") or s.get("pane") or s.get("key", "?")
+        ag = s.get("agent", "?")
+        if s.get("model"):
+            ag = f"{ag}/{s['model']}"
+        br = s.get("branch") or "-"
+        ult = s.get("last_task_ora") or s.get("last_task_hm") or "-"
+        spd = s.get("speed_str") or "↓--/s ↑--/s"
+        summ = s.get("summary") or "-"
+        print(f"  • [{coords}] {ag} ({br}) │ ult:{ult} │ {spd} │ {summ}")
+
+    print(f"\nActive file claims ({len(claims)}):")
+    if not claims:
+        print("  (no active file claims)")
+    for c in claims:
+        age_m = int(max(0.0, time.time() - float(c.get("updated_at") or 0)) // 60)
+        paths_s = ", ".join(c.get("paths") or [])
+        print(
+            f"  • {c.get('agent')}/{c.get('session')} (branch: {c.get('branch') or '-'}, "
+            f"pid: {c.get('pid')}, {age_m}m ago) → {paths_s}"
+        )
+    return 0
+
+
+def cmd_bar(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    pane = os.environ.get("TMUX_PANE", "").strip()
+    key = _resolve_session_key(args.key or "", args.exclude_session or "")
+    cur = _read_json(coord_dir / "sessions" / f"{key}.json")
+    if not cur and not os.environ.get("AGENT_COORD_DIR"):
+        legacy_f = Path(os.environ.get("AIAGENS_FLOTTA_DIR", "/var/lib/aiagens/sessioni-stato")) / "sessioni" / f"{key}.json"
+        cur = _read_json(legacy_f)
+
+    agent = cur.get("agent") or _detect_agent()
+    coords = cur.get("tmux_target") or _detect_tmux_coords(pane)
+    unread_count = len(_collect_unread_messages(coord_dir, key=key, pane=pane, agent=agent, coords=coords, consume=False))
+
+    ult = cur.get("last_task_hm") or _now_local().strftime("%H:%M")
+    summary = cur.get("summary") or ""
+    max_len = int(args.max_len or 80)
+    if len(summary) > max_len:
+        summary = summary[: max_len - 1].rstrip() + "…"
+
+    parts = [f"ult:{ult}"]
+    if summary:
+        parts.append(summary)
+    if unread_count > 0:
+        parts.append(f"📬{unread_count}")
+    print(" │ ".join(parts))
+    return 0
+
+
+def cmd_context(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    pane = os.environ.get("TMUX_PANE", "").strip()
+    key = _resolve_session_key(args.session or "")
+    cur = _read_json(coord_dir / "sessions" / f"{key}.json")
+    if not cur and not os.environ.get("AGENT_COORD_DIR"):
+        legacy_f = Path(os.environ.get("AIAGENS_FLOTTA_DIR", "/var/lib/aiagens/sessioni-stato")) / "sessioni" / f"{key}.json"
+        cur = _read_json(legacy_f)
+
+    agent = cur.get("agent") or _detect_agent()
+    coords = cur.get("tmux_target") or _detect_tmux_coords(pane)
+    msgs = _collect_unread_messages(coord_dir, key=key, pane=pane, agent=agent, coords=coords, consume=args.consume)
+    sessions = _list_active_sessions(coord_dir, max_age_minutes=180)
+    claims = _load_active_claims(coord_dir)
+
+    lines: list[str] = []
+    ult_str = cur.get("last_task_data") or _now_local().strftime("%H:%M %Z %d/%m/%Y")
+    spd_str = cur.get("speed_str") or "↓--/s ↑--/s"
+    summ_str = cur.get("summary") or "Session start"
+    lines.append(
+        f"[SESSION STATE ({coords or key})] Last task: {ult_str} │ Speed: {spd_str} │ Activity: {summ_str}"
+    )
+
+    if msgs:
+        lines.append("[UNREAD INTER-SESSION MESSAGES]")
+        for m in msgs:
+            mitt = f"{m.get('da_agente', '?')}@{m.get('da_coords') or m.get('da_key', '?')}"
+            lines.append(f"  - [{m.get('ora', '')}] From {mitt}: {m.get('testo', '')}")
+
+    if claims:
+        claim_items = [
+            f"{c.get('agent')}/{c.get('session')}[{c.get('branch') or '-'}]: {', '.join(c.get('paths') or [])}"
+            for c in claims[:8]
+        ]
+        lines.append("[ACTIVE FILE CLAIMS] " + " ; ".join(claim_items))
+
+    peers = [s for s in sessions if s.get("key") != key][:8]
+    if peers:
+        peer_items = []
+        for p in peers:
+            c = p.get("tmux_target") or p.get("pane") or p.get("key", "?")
+            peer_items.append(
+                f"{c}:{p.get('agent','?')}[{p.get('branch','-')}] ult:{p.get('last_task_hm','-')} «{_clean_summary(p.get('summary',''), 42)}»"
+            )
+        lines.append("[ACTIVE FLEET COORDINATION] " + " ; ".join(peer_items))
+
+    print("\n".join(lines))
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    now = _now_local()
+    pane = os.environ.get("TMUX_PANE", "").strip()
+    key = _resolve_session_key(args.from_key or "")
+    cur = _read_json(coord_dir / "sessions" / f"{key}.json")
+
+    da_agente = args.sender or cur.get("agent") or _detect_agent()
+    da_branch = cur.get("branch") or _detect_branch(os.getcwd())
+    da_coords = cur.get("tmux_target") or _detect_tmux_coords(pane) or key
+
+    raw_dest = args.target.strip()
+    if raw_dest.lower() in ("tutti", "all", "*"):
+        dest_key = "all"
+    elif raw_dest.startswith("%"):
+        dest_key = _safe_key(f"pane_{raw_dest.lstrip('%')}")
+    else:
+        dest_key = _safe_key(raw_dest)
+
+    msg_id = hashlib.sha1(f"{now.timestamp()}:{key}:{dest_key}:{args.message}".encode("utf-8")).hexdigest()[:16]
+    msg = {
+        "id": msg_id,
+        "ts": now.timestamp(),
+        "ora": now.strftime("%H:%M:%S %d/%m/%Y"),
+        "da_key": key,
+        "da_pane": pane,
+        "da_coords": da_coords,
+        "da_agente": da_agente,
+        "da_branch": da_branch,
+        "dest": raw_dest,
+        "dest_key": dest_key,
+        "testo": args.message.strip(),
+    }
+
+    line = json.dumps(msg, ensure_ascii=False) + "\n"
+    target_file = coord_dir / "messages" / f"{dest_key}.jsonl"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    with target_file.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+    print(f"Message [{msg_id}] sent to '{raw_dest}' ({dest_key}) at {msg['ora']}.")
+    return 0
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    coord_dir = get_coord_dir()
+    pane = os.environ.get("TMUX_PANE", "").strip()
+    target_session = args.session_pos or args.session or ""
+    key = _resolve_session_key(target_session)
+    cur = _read_json(coord_dir / "sessions" / f"{key}.json")
+    agent = cur.get("agent") or _detect_agent()
+    coords = cur.get("tmux_target") or _detect_tmux_coords(pane)
+    msgs = _collect_unread_messages(coord_dir, key=key, pane=pane, agent=agent, coords=coords, consume=args.consume)
+    if args.json:
+        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        return 0
+    for m in msgs:
+        mitt = f"{m.get('da_agente', '?')}@{m.get('da_coords') or m.get('da_key', '?')}"
+        if m.get("da_branch"):
+            mitt += f" ({m['da_branch']})"
+        print(f"[{m.get('ora', '')}] From {mitt} → {m.get('dest', 'you')}: {m.get('testo', '')}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="agent-coord",
+        description="Zero-dependency multi-agent anti-collision & fleet coordination CLI.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # claim
+    p_claim = sub.add_parser("claim", help="Claim file/directory paths with atomic flock & PID birth verification")
+    p_claim.add_argument("paths", nargs="+", help="File or directory paths to claim")
+    p_claim.add_argument("--session", "--sessione", dest="session", default="")
+    p_claim.add_argument("--agent", "--agente", dest="agent", default="")
+    p_claim.add_argument("--branch", "--ramo", dest="branch", default="")
+    p_claim.add_argument("--intent", "--nota", dest="intent", default="")
+    p_claim.add_argument("--auto", action="store_true", help="Use 45m auto-renewal TTL instead of 6h manual TTL")
+    p_claim.add_argument("--anyway", "--forza", dest="anyway", action="store_true", help="Force claim despite conflict")
+    p_claim.set_defaults(func=cmd_claim)
+
+    # guard
+    p_guard = sub.add_parser("guard", help="PreToolUse hook guard: auto-claim if free (exit 0) or block on conflict (exit 2)")
+    p_guard.add_argument("paths", nargs="*", help="Paths to guard (or read from Hook stdin JSON if omitted)")
+    p_guard.add_argument("--session", "--sessione", dest="session", default="")
+    p_guard.add_argument("--agent", "--agente", dest="agent", default="")
+    p_guard.set_defaults(func=cmd_guard)
+
+    # check
+    p_check = sub.add_parser("check", help="Read-only conflict check (exit 0 if free, exit 1 if held)")
+    p_check.add_argument("paths", nargs="+", help="Paths to check")
+    p_check.add_argument("--session", "--sessione", dest="session", default="")
+    p_check.add_argument("--agent", "--agente", dest="agent", default="")
+    p_check.set_defaults(func=cmd_check)
+
+    # release
+    p_rel = sub.add_parser("release", help="Release claims held by the current session")
+    p_rel.add_argument("paths", nargs="*", help="Optional specific paths to release (releases all if omitted)")
+    p_rel.add_argument("--session", "--sessione", dest="session", default="")
+    p_rel.add_argument("--agent", "--agente", dest="agent", default="")
+    p_rel.set_defaults(func=cmd_release)
+
+    # register / registra
+    for reg_name in ("register", "registra"):
+        p_reg = sub.add_parser(reg_name, help="Register or update session telemetry and end-of-task summary")
+        p_reg.add_argument("--key", "--chiave", dest="key", default="")
+        p_reg.add_argument("--pane", default="")
+        p_reg.add_argument("--session", "--sessione", dest="session", default="")
+        p_reg.add_argument("--agent", "--agente", dest="agent", default="")
+        p_reg.add_argument("--model", "--modello", dest="model", default="")
+        p_reg.add_argument("--cwd", default="")
+        p_reg.add_argument("--branch", "--ramo", dest="branch", default="")
+        p_reg.add_argument("--summary", "--riassunto", dest="summary", default="")
+        p_reg.add_argument("--vel-in", type=float, default=None)
+        p_reg.add_argument("--vel-out", type=float, default=None)
+        p_reg.add_argument("--vel-str", default="")
+        p_reg.add_argument("--aggiorna-ora", "--touch", dest="aggiorna_ora", action="store_true")
+        p_reg.add_argument("--stampa", "--print", dest="stampa", action="store_true")
+        p_reg.set_defaults(func=cmd_register)
+
+    # status / quadro
+    for st_name in ("status", "quadro"):
+        p_st = sub.add_parser(st_name, help="Show active fleet sessions, speeds, and active file claims")
+        p_st.add_argument("--active-minutes", "--attive-minuti", dest="active_minutes", type=int, default=180)
+        p_st.add_argument("--no-sync", action="store_true")
+        p_st.add_argument("--json", action="store_true")
+        p_st.set_defaults(func=cmd_status)
+
+    # bar / barra
+    for bar_name in ("bar", "barra"):
+        p_bar = sub.add_parser(bar_name, help="Output compact 1-line summary for the 2-line statusbar")
+        p_bar.add_argument("--key", "--chiave", dest="key", default="")
+        p_bar.add_argument("--exclude-session", "--escludi-sessione", dest="exclude_session", default="")
+        p_bar.add_argument("--max-len", "--max-riassunto", dest="max_len", type=int, default=80)
+        p_bar.set_defaults(func=cmd_bar)
+
+    # context / contesto
+    for ctx_name in ("context", "contesto"):
+        p_ctx = sub.add_parser(ctx_name, help="Output session state, active claims, and unread messages for hooks")
+        p_ctx.add_argument("--session", "--sessione", "--chiave", "--key", dest="session", default="")
+        p_ctx.add_argument("--consume", "--consuma", dest="consume", action="store_true")
+        p_ctx.set_defaults(func=cmd_context)
+
+    # send / invia
+    for snd_name in ("send", "invia"):
+        p_snd = sub.add_parser(snd_name, help="Send an inter-session message to a target session or 'all'/'tutti'")
+        p_snd.add_argument("target", help="Target session/pane/agent or 'all'/'tutti'")
+        p_snd.add_argument("message", help="Message content")
+        p_snd.add_argument("--da", "--from", dest="sender", default="")
+        p_snd.add_argument("--da-chiave", "--from-key", dest="from_key", default="")
+        p_snd.set_defaults(func=cmd_send)
+
+    # inbox / leggi
+    for inb_name in ("inbox", "leggi"):
+        p_inb = sub.add_parser(inb_name, help="Read unread inter-session messages")
+        p_inb.add_argument("session_pos", nargs="?", default="", help="Optional session key")
+        p_inb.add_argument("--session", "--sessione", "--chiave", "--key", dest="session", default="")
+        p_inb.add_argument("--consume", "--consuma", dest="consume", action="store_true")
+        p_inb.add_argument("--json", action="store_true")
+        p_inb.set_defaults(func=cmd_inbox)
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,7 +12,7 @@ Tutti i testi qui sotto sono pronti da copiare e incollare, calibrati al millime
 `Show HN: Unthrottle-Agents – Your 1M-context coding agents are capped at 256k/16k`
 
 **URL:**
-`https://github.com/aiagens/unthrottle-agents`
+`https://github.com/swisscodernano/unthrottle-agents`
 
 **First Comment (da postare subito dopo l'invio):**
 > Hi HN,
@@ -77,7 +77,7 @@ Instead of guessing, I built a 2-line real-time statusbar (`bin/agent-statusline
 
 ### The Open-Source Toolkit: `unthrottle-agents` (MIT, Zero Dependencies)
 
-Repo: **`https://github.com/aiagens/unthrottle-agents`**
+Repo: **`https://github.com/swisscodernano/unthrottle-agents`**
 
 It includes 5 standalone components:
 - **`bin/agent-audit`** — 100% read-only diagnostic scanner across Antigravity, Codex, Claude Code, Pi, local `llama.cpp`, and fleet locks.

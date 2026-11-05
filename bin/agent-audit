@@ -235,7 +235,7 @@ def main() -> int:
     for comp, st, detail in checks:
         print(f"  {status_badge(st):<22} {BOLD}{comp:<34}{RESET} {detail}")
     print(
-        f"\n{DIM}Companion architecture & research from «SUPER INTELLIGENCE» (2026) — https://a.co/d/0gO1eMZX | https://github.com/aiagens/unthrottle-agents{RESET}\n"
+        f"\n{DIM}Companion architecture & research from «SUPER INTELLIGENCE» (2026) — https://a.co/d/0gO1eMZX | https://github.com/swisscodernano/unthrottle-agents{RESET}\n"
     )
     return 0
 

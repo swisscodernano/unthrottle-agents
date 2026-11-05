@@ -1,17 +1,26 @@
+<div align="center">
+
+<img src="assets/hero-banner.svg" alt="unthrottle-agents — 1M Context & Output Unthrottler + Multi-Agent Fleet Telemetry" width="100%">
+
 # ⚡ unthrottle-agents
 
-**Your 1M-context AI coding agents are silently throttled to 256k input and 16k output—and collide when run in parallel. Audit, unthrottle, monitor, and coordinate your entire fleet in real time.**
+**Your 1M-context AI coding agents are silently throttled to 256k input and 16k output—and collide when run in parallel.<br>Audit, unthrottle, monitor, and coordinate your entire fleet in real time.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
-[![Platform: Linux & macOS](https://img.shields.io/badge/Platform-Linux%20x86__64%20%7C%20macOS%20arm64-blue.svg)](#quick-start-linux-x86_64--macos-apple-silicon-arm64)
-[![Book: SUPER INTELLIGENCE](https://img.shields.io/badge/Companion%20Book-SUPER%20INTELLIGENCE%20(Amazon)-amber.svg)](https://a.co/d/0gO1eMZX)
+[![GitHub Stars](https://img.shields.io/github/stars/swisscodernano/unthrottle-agents?style=flat-square&logo=github&color=f59e0b)](https://github.com/swisscodernano/unthrottle-agents/stargazers)
+[![Release: v1.0.0](https://img.shields.io/badge/Release-v1.0.0-10b981?style=flat-square)](https://github.com/swisscodernano/unthrottle-agents/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-10b981?style=flat-square)](LICENSE)
+[![Platform: Linux & macOS](https://img.shields.io/badge/Platform-Linux%20x86__64%20%7C%20macOS%20arm64-3b82f6?style=flat-square)](#quick-start-linux-x86_64--macos-apple-silicon-arm64)
+[![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Python%203.9%2B)-8b5cf6?style=flat-square)](#repository-architecture-the-5-core-components)
+[![Book: SUPER INTELLIGENCE](https://img.shields.io/badge/📖%20Companion%20Book-SUPER%20INTELLIGENCE%20(Amazon)-f59e0b?style=flat-square)](https://a.co/d/0gO1eMZX)
 
-```text
-argon.4-(high) │ ██░░░░░░ 22% │ in:230k/1M out:14.2k/1M(Σ1.3M) │ ↓47.2k/s(5.1s) ↑104/s(14.9s) │ 5h:10% 7d:2% │ $0.00 │ 10:15
-↳ ult:10:15 │ Unlocked 950k continuous context window + 64k/leg (1M total) output ceiling across all fleet agents
+</div>
+
+```bash
+# 10-Second Audit & Install (100% read-only audit + symlinks to ~/.local/bin & Agent Skills):
+git clone https://github.com/swisscodernano/unthrottle-agents.git && cd unthrottle-agents && ./install.sh
 ```
 
-> 📖 **Official Companion Engineering Toolkit** to the international book [**_SUPER INTELLIGENCE: How to Build, Govern, and Survive High-Density Autonomous AI Systems_ — Available now on Amazon (`https://a.co/d/0gO1eMZX`)**](https://a.co/d/0gO1eMZX)
+> 📖 **Official Companion Engineering Toolkit** to the international book [**_SUPER INTELLIGENCE: How to Build, Govern, and Survive High-Density Autonomous AI Systems_ — Get it on Amazon (`https://a.co/d/0gO1eMZX`)**](https://a.co/d/0gO1eMZX)
 
 ---
 
@@ -76,8 +85,10 @@ Every configuration and patch in this repository is backed by empirical measurem
 ### 1. Audit your current coding agents (`bin/agent-audit` — 100% read-only)
 
 ```bash
-git clone https://github.com/aiagens/unthrottle-agents.git
+git clone https://github.com/swisscodernano/unthrottle-agents.git
 cd unthrottle-agents
+./install.sh          # Runs read-only audit + installs CLI tools & Book2Skill
+# Or run the read-only scanner standalone:
 python3 ./bin/agent-audit
 ```
 
@@ -156,17 +167,31 @@ mkdir -p ~/.pi/agent/skills/super-intelligence && cp skills/super-intelligence/S
 
 ## 📖 Companion Book: *SUPER INTELLIGENCE*
 
-👉 **[Get the English Edition on Amazon: *SUPER INTELLIGENCE: How to Build, Govern, and Survive High-Density Autonomous AI Systems* (`https://a.co/d/0gO1eMZX`)](https://a.co/d/0gO1eMZX)**
-
-This toolkit was born while engineering a 24/7 autonomous 22-agent software and medical-AI platform in Switzerland and writing the international book **_SUPER INTELLIGENCE_**.
-
-### What Engineers & Architects Get Inside the Book
-
-- **1M-Context Orchestration & Binary Anatomy:** How modern CLI agent harnesses (`agy`, `codex`, `claude`, `pi`) manage checkpoints, multi-leg continuation loops (`64k × 16 = 1M`), and why default 256k compaction triggers lobotomize long-horizon refactors.
-- **KV-Cache Physics & Prefill Engineering:** Why asynchronous MCP tool registration and dynamic system-prompt timestamps silently destroy prefix caching (`f_keep < 1.000`), and how to engineer deterministic prompts that sustain **47k+ tok/s cloud prefill** and **762 tok/s local GPU prefill**.
-- **Defeating Governance Decay (*Constraint Rot*):** How checkpoint summarization erases standing architectural and security invariants over multi-hour runs, and how to implement **Constraint Pinning** and decoupled compaction reasoning.
-- **22-Agent Anti-Collision Governance:** Complete blueprints for running heterogeneous model fleets (Claude, Gemini Argon, Codex, MiMo, MiniMax, DeepSeek) in parallel on a single codebase using worktree isolation, kernel-locked file claims (`agent-coord`), cross-family adversarial code review, and verify-by-effect gates.
-- **From Markov (1913) to Autonomous Fleets (2026):** The deep mathematical, historical, and philosophical lineage of machine intelligence—bridging hard systems engineering with cognitive ergonomics.
+<table>
+  <tr>
+    <td width="270" align="center" valign="top">
+      <a href="https://a.co/d/0gO1eMZX">
+        <img src="assets/super-intelligence-cover.jpg" alt="SUPER INTELLIGENCE — Official Book Cover" width="240">
+      </a>
+      <br><br>
+      <a href="https://a.co/d/0gO1eMZX">
+        <img src="https://img.shields.io/badge/Buy%20on%20Amazon-SUPER%20INTELLIGENCE-f59e0b?style=for-the-badge&logo=amazon&logoColor=white" alt="Buy on Amazon">
+      </a>
+    </td>
+    <td valign="top">
+      <h3><a href="https://a.co/d/0gO1eMZX">SUPER INTELLIGENCE: How to Build, Govern, and Survive High-Density Autonomous AI Systems</a></h3>
+      <p>This open-source toolkit was forged while engineering a 24/7 autonomous 22-agent software and medical-AI platform in Switzerland and writing the international book <strong><em>SUPER INTELLIGENCE</em></strong>.</p>
+      <ul>
+        <li><strong>1M-Context Orchestration & Binary Anatomy:</strong> How modern CLI agent harnesses (<code>agy</code>, <code>codex</code>, <code>claude</code>, <code>pi</code>) manage checkpoints, multi-leg continuation loops (<code>64k × 16 = 1M</code>), and why default 256k compaction triggers lobotomize long-horizon refactors.</li>
+        <li><strong>KV-Cache Physics & Prefill Engineering:</strong> Why asynchronous MCP tool registration and dynamic system-prompt timestamps silently destroy prefix caching (<code>f_keep &lt; 1.000</code>), and how to engineer deterministic prompts that sustain <strong>47k+ tok/s cloud prefill</strong> and <strong>762 tok/s local GPU prefill</strong>.</li>
+        <li><strong>Defeating Governance Decay (<em>Constraint Rot</em>):</strong> How checkpoint summarization erases standing architectural and security invariants over multi-hour runs, and how to implement <strong>Constraint Pinning</strong> and decoupled compaction reasoning.</li>
+        <li><strong>22-Agent Anti-Collision Governance:</strong> Complete blueprints for running heterogeneous model fleets (Claude, Gemini Argon, Codex, MiMo, MiniMax, DeepSeek) in parallel on a single codebase using worktree isolation, kernel-locked file claims (<code>agent-coord</code>), cross-family adversarial code review, and verify-by-effect gates.</li>
+        <li><strong>From Markov (1913) to Autonomous Fleets (2026):</strong> The deep mathematical, historical, and philosophical lineage of machine intelligence—bridging hard systems engineering with cognitive ergonomics.</li>
+      </ul>
+      <p>👉 <a href="https://a.co/d/0gO1eMZX"><strong>Get the English Edition on Amazon (<code>https://a.co/d/0gO1eMZX</code>) — Available in Kindle, Paperback, and Hardcover</strong></a></p>
+    </td>
+  </tr>
+</table>
 
 ### Available Worldwide in 11 Language Editions
 

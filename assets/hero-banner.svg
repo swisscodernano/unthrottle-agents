@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 560" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#070b12"/>
+      <stop offset="50%" stop-color="#0d1424"/>
+      <stop offset="100%" stop-color="#090d18"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="50%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity="0.65"/>
+    </filter>
+  </defs>
+
+  <!-- Outer Card -->
+  <rect x="8" y="8" width="1104" height="544" rx="16" fill="url(#bgGrad)" stroke="#1e293b" stroke-width="2" filter="url(#shadow)"/>
+  <rect x="8" y="8" width="1104" height="4" rx="2" fill="url(#accentGrad)"/>
+
+  <!-- Window Controls & Title Bar -->
+  <circle cx="36" cy="36" r="7" fill="#ef4444"/>
+  <circle cx="58" cy="36" r="7" fill="#f59e0b"/>
+  <circle cx="80" cy="36" r="7" fill="#10b981"/>
+  <text x="560" y="41" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="14" font-weight="600">
+    ⚡ swisscodernano/unthrottle-agents — 1M Context &amp; Output Unthrottler + Multi-Agent Fleet Telemetry
+  </text>
+  <line x1="8" y1="60" x2="1112" y2="60" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Section 1: Live 2-Line Statusbar Preview -->
+  <rect x="32" y="78" width="1056" height="86" rx="10" fill="#05080f" stroke="#334155" stroke-width="1.5"/>
+  <text x="48" y="100" fill="#64748b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="700">
+    LIVE 2-LINE AGENT TELEMETRY BAR (SEPARATES ↓ PREFILL FROM ↑ DECODE SPEED + ACTIVE/MAX WINDOWS)
+  </text>
+  <text x="48" y="126" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14.5" font-weight="600">
+    <tspan fill="#38bdf8">argon.4-(high)</tspan>
+    <tspan fill="#475569"> │ </tspan>
+    <tspan fill="#10b981">██░░░░░░ 22%</tspan>
+    <tspan fill="#475569"> │ </tspan>
+    <tspan fill="#e2e8f0">in:</tspan><tspan fill="#38bdf8">230k</tspan><tspan fill="#94a3b8">/1M</tspan>
+    <tspan fill="#e2e8f0"> out:</tspan><tspan fill="#10b981">14.2k</tspan><tspan fill="#94a3b8">/1M(Σ1.3M)</tspan>
+    <tspan fill="#475569"> │ </tspan>
+    <tspan fill="#f59e0b">↓47.2k/s(5.1s)</tspan>
+    <tspan fill="#a855f7"> ↑104/s(14.9s)</tspan>
+    <tspan fill="#475569"> │ </tspan>
+    <tspan fill="#94a3b8">5h:10% 7d:2%</tspan>
+    <tspan fill="#475569"> │ </tspan>
+    <tspan fill="#10b981">$0.00</tspan>
+  </text>
+  <text x="48" y="150" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5">
+    <tspan fill="#f59e0b">↳ ult:15:30</tspan>
+    <tspan fill="#475569"> │ </tspan>
+    <tspan fill="#cbd5e1">Unlocked 950k continuous context + 64k/leg (1M total) output ceiling across fleet</tspan>
+    <tspan fill="#475569"> │ </tspan>
+    <tspan fill="#38bdf8">flotta: 6 active (0 claims)</tspan>
+    <tspan fill="#475569"> │ </tspan>
+    <tspan fill="#10b981">📬0</tspan>
+  </text>
+
+  <!-- Section 2: Before vs After Comparison Boxes -->
+  <!-- Left Box: Hidden Default CLI Throttles -->
+  <rect x="32" y="182" width="514" height="148" rx="10" fill="#160b10" stroke="#7f1d1d" stroke-width="1.5"/>
+  <text x="52" y="208" fill="#f87171" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" font-weight="700">
+    ❌ BEFORE: HIDDEN DEFAULT CLI HARNESS CAPS
+  </text>
+  <text x="52" y="234" fill="#fca5a5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Antigravity input compaction:  0x3e800 (256,000 tokens — 75% wasted)
+  </text>
+  <text x="52" y="256" fill="#fca5a5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Antigravity output ceiling:    0x4000  (16,384 tokens — cuts files)
+  </text>
+  <text x="52" y="278" fill="#fca5a5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Codex tool_output_token_limit: 10,000 tokens (truncates diffs/logs)
+  </text>
+  <text x="52" y="300" fill="#fca5a5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Pi thinkingBudgets.high:       16,384 tokens + compaction crash
+  </text>
+  <text x="52" y="320" fill="#fca5a5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Multi-agent shared repo:       Silent file overwrites &amp; cache breaks
+  </text>
+
+  <!-- Right Box: With unthrottle-agents -->
+  <rect x="574" y="182" width="514" height="148" rx="10" fill="#071914" stroke="#065f46" stroke-width="1.5"/>
+  <text x="594" y="208" fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5" font-weight="700">
+    ✅ AFTER: UNTHROTTLED 1M ARCHITECTURE
+  </text>
+  <text x="594" y="234" fill="#a7f3d0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Continuous input window:       0xe7ef0 (950,000 / 1,048,576 tokens)
+  </text>
+  <text x="594" y="256" fill="#a7f3d0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Multi-leg Orchestrator output: 65,536/leg × 16 = 1,048,576 (1M) out
+  </text>
+  <text x="594" y="278" fill="#a7f3d0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Codex &amp; Pi unlocked:           950k window + 65,536 thinking/tool cap
+  </text>
+  <text x="594" y="300" fill="#a7f3d0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • KV-Cache Prefix Invariant:     f_keep = 1.000 + Constraint Pinning
+  </text>
+  <text x="594" y="320" fill="#a7f3d0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    • Kernel flock anti-collision:   agent-coord + PID birth-time guard
+  </text>
+
+  <!-- Section 3: Audit Terminal Output -->
+  <rect x="32" y="346" width="1056" height="154" rx="10" fill="#05080f" stroke="#1e293b" stroke-width="1.5"/>
+  <text x="52" y="370" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
+    $ python3 ./bin/agent-audit
+  </text>
+  <text x="52" y="393" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    <tspan fill="#10b981" font-weight="700">[UNLOCKED]</tspan><tspan fill="#e2e8f0">  Antigravity Output Window          64k/leg + 1,048,576 (1M) Orchestrator ceiling active in agy-bin</tspan>
+  </text>
+  <text x="52" y="413" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    <tspan fill="#10b981" font-weight="700">[UNLOCKED]</tspan><tspan fill="#e2e8f0">  Antigravity Input Compaction       Compacts at 950,000 / 1,048,576 tokens (90.6% window) with 64k summary</tspan>
+  </text>
+  <text x="52" y="433" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    <tspan fill="#10b981" font-weight="700">[UNLOCKED]</tspan><tspan fill="#e2e8f0">  OpenAI Codex &amp; Pi Coding Agent     1M context + 950k auto-compact + 65,536 thinking &amp; tool output limits</tspan>
+  </text>
+  <text x="52" y="453" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    <tspan fill="#10b981" font-weight="700">[UNLOCKED]</tspan><tspan fill="#e2e8f0">  Local llama.cpp KV-Cache Router    f_keep = 1.000 deterministic tool sorting (4.6 tok/s → 762 tok/s prefill)</tspan>
+  </text>
+  <text x="52" y="473" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    <tspan fill="#10b981" font-weight="700">[UNLOCKED]</tspan><tspan fill="#e2e8f0">  Fleet Anti-Collision (agent-coord) Active (fcntl.flock + PID birth-time guard) — 6 active sessions, 0 conflicts</tspan>
+  </text>
+
+  <!-- Footer Banner: Companion Book Callout -->
+  <text x="560" y="528" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600">
+    <tspan fill="#f59e0b">📖 Official Companion Engineering Toolkit to the Book </tspan>
+    <tspan fill="#ffffff">«SUPER INTELLIGENCE»</tspan>
+    <tspan fill="#38bdf8"> — https://a.co/d/0gO1eMZX (Available in 11 Languages)</tspan>
+  </text>
+</svg>

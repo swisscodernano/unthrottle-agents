@@ -1,6 +1,8 @@
-# 🚀 Kit di Lancio Virale (`unthrottle-agents` + Libro *SUPER INTELLIGENCE*)
+# 🚀 Kit di Lancio Virale (`unthrottle-agents` + Libro *SUPER INTELLIGENCE* / *SUPER INTELLIGENZA*)
 
-> 📖 **Link Ufficiale Amazon (Edizione Inglese Flagship):** [**`https://a.co/d/0gO1eMZX`**](https://a.co/d/0gO1eMZX)
+> 📖 **Link Ufficiale Amazon — Edizione Inglese (*SUPER INTELLIGENCE*):** [**`https://a.co/d/0gO1eMZX`**](https://a.co/d/0gO1eMZX)
+> 📖 **Link Ufficiale Amazon — Edizione Italiana (*SUPER INTELLIGENZA*):** [**`https://a.co/d/0fA8p5u6`**](https://a.co/d/0fA8p5u6)
+> 💻 **Repository GitHub Open-Source:** [**`https://github.com/swisscodernano/unthrottle-agents`**](https://github.com/swisscodernano/unthrottle-agents)
 
 Tutti i testi qui sotto sono pronti da copiare e incollare, calibrati al millimetro per **Hacker News (`Show HN`)**, **Reddit (`r/LocalLLaMA`, `r/ClaudeAI`, `r/singularity`)**, **X / Twitter**, **LinkedIn** e **Video Shorts da 90 secondi**. L'orario migliore per pubblicare su **Hacker News** e **Reddit** è tra le **14:30 e le 16:00 CET** (8:30–10:00 EST, quando si sveglia la costa Est americana ed è già online tutta l'Europa).
 

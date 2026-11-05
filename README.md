@@ -188,7 +188,10 @@ mkdir -p ~/.pi/agent/skills/super-intelligence && cp skills/super-intelligence/S
         <li><strong>22-Agent Anti-Collision Governance:</strong> Complete blueprints for running heterogeneous model fleets (Claude, Gemini Argon, Codex, MiMo, MiniMax, DeepSeek) in parallel on a single codebase using worktree isolation, kernel-locked file claims (<code>agent-coord</code>), cross-family adversarial code review, and verify-by-effect gates.</li>
         <li><strong>From Markov (1913) to Autonomous Fleets (2026):</strong> The deep mathematical, historical, and philosophical lineage of machine intelligence—bridging hard systems engineering with cognitive ergonomics.</li>
       </ul>
-      <p>👉 <a href="https://a.co/d/0gO1eMZX"><strong>Get the English Edition on Amazon (<code>https://a.co/d/0gO1eMZX</code>) — Available in Kindle, Paperback, and Hardcover</strong></a></p>
+      <p>
+        🇬🇧 <a href="https://a.co/d/0gO1eMZX"><strong>English Edition on Amazon (<code>https://a.co/d/0gO1eMZX</code>)</strong></a><br>
+        🇮🇹 <a href="https://a.co/d/0fA8p5u6"><strong>Edizione Italiana su Amazon (<code>https://a.co/d/0fA8p5u6</code>)</strong></a>
+      </p>
     </td>
   </tr>
 </table>
@@ -198,7 +201,7 @@ mkdir -p ~/.pi/agent/skills/super-intelligence && cp skills/super-intelligence/S
 If this repository saved you tokens, unlocked your 1M context window, or stopped your parallel agents from overwriting each other's code, support our independent engineering research by grabbing the book (Kindle, Kobo EPUB3, Paperback, and Hardcover):
 
 1. 🇬🇧 **English (Flagship Edition):** [**_SUPER INTELLIGENCE_ — Buy on Amazon (`https://a.co/d/0gO1eMZX`)**](https://a.co/d/0gO1eMZX) *(also on Rakuten Kobo)*
-2. 🇮🇹 **Italiano:** *_SUPER INTELLIGENZA_* (Amazon KDP & Rakuten Kobo)
+2. 🇮🇹 **Italiano:** [**_SUPER INTELLIGENZA_ — Acquista su Amazon (`https://a.co/d/0fA8p5u6`)**](https://a.co/d/0fA8p5u6) *(anche su Rakuten Kobo)*
 3. 🇩🇪 **Deutsch:** *_SUPERINTELLIGENZ_* (Amazon KDP & Rakuten Kobo)
 4. 🇫🇷 **Français:** *_SUPER INTELLIGENCE_* (Amazon KDP & Rakuten Kobo)
 5. 🇪🇸 **Español:** *_SUPERINTELIGENCIA_* (Amazon KDP & Rakuten Kobo)

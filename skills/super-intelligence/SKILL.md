@@ -68,5 +68,7 @@ When 2 to 22+ coding agents operate concurrently on the same repository, natural
 ---
 
 ### Reference & Further Reading
-- **Book:** [**_SUPER INTELLIGENCE: How to Build, Govern, and Survive High-Density Autonomous AI Systems_**](https://a.co/d/0gO1eMZX) (Available in 11 languages: EN, IT, DE, FR, ES, PT, JA, ZH, KO, RU, AR).
-- **Toolkit:** `unthrottle-agents` (`bin/agent-audit`, `bin/agy-unlock-1m`, `bin/agent-statusline`, `bin/agent-coord`).
+- **Book (English Edition):** [**_SUPER INTELLIGENCE: How to Build, Govern, and Survive High-Density Autonomous AI Systems_ (`https://a.co/d/0gO1eMZX`)**](https://a.co/d/0gO1eMZX)
+- **Book (Italian Edition):** [**_SUPER INTELLIGENZA_ (`https://a.co/d/0fA8p5u6`)**](https://a.co/d/0fA8p5u6)
+- **Global Editions:** Available in 11 languages (EN, IT, DE, FR, ES, PT, JA, ZH, KO, RU, AR).
+- **Toolkit:** `unthrottle-agents` (`bin/agent-audit`, `bin/agy-unlock-1m`, `bin/agent-statusline`, `bin/agent-coord`) — `https://github.com/swisscodernano/unthrottle-agents`.
